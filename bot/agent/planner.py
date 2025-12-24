@@ -44,7 +44,12 @@ MECHANISMS, PATHS & SIGNPOSTS (Inside–Bridge)
 Concrete paths to different outcomes (YES/NO or high/low), key gates and bottlenecks, and leading indicators that would significantly update the forecast.
 
 MARKETS & AGGREGATED EXPERT SENTIMENT (Outside View)
-Prediction markets, forecasting platforms, expert consensus. Treat these as crowd priors, not oracles.
+Prediction markets, forecasting platforms (Metaculus, Manifold, Polymarket), expert consensus. 
+CRITICAL: For any question that might have existing forecasts, you MUST include queries like:
+- "[question topic] Metaculus probability forecast"
+- "[question topic] Manifold market odds percentage"  
+- "[question topic] prediction market forecast"
+These community probabilities serve as strong Bayesian priors for calibration.
         Add or drop baskets as appropriate, but cover these dimensions when they are relevant.
 
         Output MUST follow this exact format in Markdown:

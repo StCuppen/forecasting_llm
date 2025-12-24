@@ -144,8 +144,9 @@ def extract_market_probabilities(text: str) -> list[dict]:
     Looks for patterns like:
     - "Metaculus community: 7%"
     - "Manifold: 15%"  
-    - "Polymarket odds: 0.12"
-    - "community prediction is 8%"
+    - "7% chance" near market names
+    - "forecast of 0.07"
+    - Percentages in close proximity to market source names
     
     Returns:
         List of dicts with 'source' and 'probability' keys
@@ -153,58 +154,69 @@ def extract_market_probabilities(text: str) -> list[dict]:
     import re
     
     priors = []
-    
-    # Common patterns for probabilities
-    patterns = [
-        # "Metaculus: 7%" or "community: 7%"
-        r'(?:metaculus|manifold|polymarket|predictit|community|crowd|forecast)\s*(?:prediction|odds|probability|forecast)?[:\s]+(\d+(?:\.\d+)?)\s*%',
-        # "7% on Metaculus"
-        r'(\d+(?:\.\d+)?)\s*%\s+(?:on\s+)?(?:metaculus|manifold|polymarket)',
-        # "probability of 0.07" near market names
-        r'(?:metaculus|manifold|polymarket).*?(?:probability|odds)[:\s]+(?:of\s+)?(\d*\.\d+)',
-        # "0.07 probability" after market name
-        r'(?:metaculus|manifold|polymarket).*?(\d*\.\d+)\s*(?:probability|odds)',
-    ]
-    
     text_lower = text.lower()
     
-    for pattern in patterns:
-        for match in re.finditer(pattern, text_lower):
-            try:
-                prob_str = match.group(1)
-                prob = float(prob_str)
-                
-                # Convert percentage to decimal if needed
-                if prob > 1:
-                    prob = prob / 100
-                    
-                # Sanity check
-                if 0 < prob < 1:
-                    # Try to identify source
-                    source = "unknown"
-                    context = text_lower[max(0, match.start()-50):match.end()+50]
-                    if "metaculus" in context:
-                        source = "metaculus"
-                    elif "manifold" in context:
-                        source = "manifold"
-                    elif "polymarket" in context:
-                        source = "polymarket"
-                    elif "community" in context:
-                        source = "community"
-                        
-                    priors.append({"source": source, "probability": prob})
-            except (ValueError, IndexError):
+    # Source keywords to look for
+    sources = ["metaculus", "manifold", "polymarket", "predictit", "community", "crowd", "superforecaster"]
+    
+    # Find all percentages in the text
+    percent_pattern = r'(\d{1,2}(?:\.\d+)?)\s*%'
+    
+    for match in re.finditer(percent_pattern, text_lower):
+        try:
+            prob_str = match.group(1)
+            prob = float(prob_str) / 100  # Convert to decimal
+            
+            # Sanity check - reasonable probability
+            if not (0.01 <= prob <= 0.99):
+                continue
+            
+            # Check context around the percentage (300 chars before, 100 after)
+            context_start = max(0, match.start() - 300)
+            context_end = min(len(text_lower), match.end() + 100)
+            context = text_lower[context_start:context_end]
+            
+            # Look for source keywords in the context
+            for source in sources:
+                if source in context:
+                    # Additional filtering: avoid matching unrelated percentages
+                    # by checking for forecasting-related keywords nearby
+                    forecast_keywords = ["forecast", "predict", "probability", "odds", "chance", 
+                                        "likelihood", "estimate", "expect", "median", "average"]
+                    if any(kw in context for kw in forecast_keywords) or source in ["metaculus", "manifold", "polymarket"]:
+                        priors.append({"source": source, "probability": prob})
+                        break  # Only attribute to first source found
+        except (ValueError, IndexError):
+            continue
+    
+    # Also look for decimal probabilities (e.g., "0.07")
+    decimal_pattern = r'\b0\.(\d{1,2})\b'
+    for match in re.finditer(decimal_pattern, text_lower):
+        try:
+            prob = float(match.group(0))
+            if not (0.01 <= prob <= 0.99):
                 continue
                 
-    # Deduplicate by source, keeping first found
-    seen_sources = set()
-    unique_priors = []
-    for p in priors:
-        if p["source"] not in seen_sources:
-            seen_sources.add(p["source"])
-            unique_priors.append(p)
+            context_start = max(0, match.start() - 300)
+            context_end = min(len(text_lower), match.end() + 100)
+            context = text_lower[context_start:context_end]
             
-    return unique_priors
+            for source in sources:
+                if source in context:
+                    priors.append({"source": source, "probability": prob})
+                    break
+        except (ValueError, IndexError):
+            continue
+    
+    # Deduplicate by source, keeping lowest probability (more conservative)
+    # This helps when multiple numbers are found near a source name
+    by_source = {}
+    for p in priors:
+        src = p["source"]
+        if src not in by_source or p["probability"] < by_source[src]["probability"]:
+            by_source[src] = p
+            
+    return list(by_source.values())
 
 
 def extract_json_from_response(response_text: str) -> dict:

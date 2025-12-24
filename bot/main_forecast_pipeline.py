@@ -232,13 +232,21 @@ class TemplateForecaster(ForecastBot):
         """Run forecast on binary question using the agent ensemble."""
         logger.info(f"Running ensemble forecast for: {question.question_text}")
         
+        # Extract community prediction from Metaculus if available
+        community_prior = None
+        if hasattr(question, 'community_prediction_at_access_time'):
+            community_prior = question.community_prediction_at_access_time
+            if community_prior is not None:
+                logger.info(f"Using Metaculus community prior: {community_prior:.1%}")
+        
         try:
             # Call the ensemble function from agent_experiment.py
             # We do NOT publish to Metaculus here because the ForecastBot framework handles that.
             result = await run_ensemble_forecast(
                 question=question.question_text,
                 models=None, # Use default ensemble
-                publish_to_metaculus=False 
+                publish_to_metaculus=False,
+                community_prior=community_prior,
             )
             
             final_prob = result["final_probability"]

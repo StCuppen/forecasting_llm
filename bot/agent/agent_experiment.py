@@ -531,7 +531,7 @@ class ForecastingAgent:
         )
         return text
 
-    async def run_iterative(self, question: str, max_iterations: int = 3) -> AgentForecastResult:
+    async def run_iterative(self, question: str, max_iterations: int = 3, community_prior: float = None) -> AgentForecastResult:
         """
         Run the agent with iterative research capability.
 
@@ -545,6 +545,7 @@ class ForecastingAgent:
         Args:
             question: The forecasting question
             max_iterations: Maximum research iterations (default 3)
+            community_prior: Metaculus/market community prediction (0-1) to use as anchor
         """
         today_str = datetime.utcnow().date().isoformat()
 
@@ -628,10 +629,19 @@ class ForecastingAgent:
 
         # Extract market/community priors from research for anchoring
         market_priors = extract_market_probabilities(final_research_memo)
+        
+        # If we have a community prior passed directly from Metaculus, add it (higher priority)
+        if community_prior is not None:
+            # Add/overwrite with the direct Metaculus prior
+            metaculus_priors = [p for p in market_priors if p["source"] != "metaculus"]
+            metaculus_priors.append({"source": "metaculus", "probability": community_prior})
+            market_priors = metaculus_priors
+            logger.info(f"Using direct Metaculus community prior: {community_prior:.1%}")
+        
         if market_priors:
-            logger.info(f"Found market/community priors: {market_priors}")
+            logger.info(f"Found market/community priors for anchoring: {market_priors}")
         else:
-            logger.info("No market/community priors found in research")
+            logger.info("No market/community priors found for anchoring")
 
         # Generate final forecast with all research
         agent_output = await self._iterative_forecast(
@@ -649,11 +659,15 @@ class ForecastingAgent:
             final_forecast=agent_output,
         )
 
-    async def run_forecast(self, question: str) -> "AgentForecastOutput":
+    async def run_forecast(self, question: str, community_prior: float = None) -> "AgentForecastOutput":
         """
         Runs the iterative forecasting agent and extracts the final probability and explanation.
+        
+        Args:
+            question: The forecasting question text.
+            community_prior: Metaculus/market community prediction (0-1) to use as anchor.
         """
-        forecast_result = await self.run_iterative(question)
+        forecast_result = await self.run_iterative(question, community_prior=community_prior)
         
         probability = extract_probability_from_forecast(forecast_result.final_forecast)
         
@@ -734,7 +748,8 @@ def extract_probability_from_forecast(forecast_text: str) -> float:
 async def run_ensemble_forecast(
     question: str,
     models: list[dict] = None,
-    publish_to_metaculus: bool = False
+    publish_to_metaculus: bool = False,
+    community_prior: float = None,
 ) -> dict:
     """
     Run an ensemble of forecasting agents on a question.
@@ -743,6 +758,7 @@ async def run_ensemble_forecast(
         question: The forecasting question text.
         models: List of model configs. If None, uses default ensemble.
         publish_to_metaculus: Whether to post the result to Metaculus.
+        community_prior: Metaculus community prediction (0-1) to use as anchor.
         
     Returns:
         dict containing:
@@ -780,7 +796,7 @@ async def run_ensemble_forecast(
                 reasoning_effort=config.get("reasoning_effort")
             )
             
-            result = await agent.run_forecast(question)
+            result = await agent.run_forecast(question, community_prior=community_prior)
             
             results.append({
                 "config": config,

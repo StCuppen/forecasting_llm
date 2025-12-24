@@ -17,6 +17,8 @@ from .utils import (
     clean_indents,
     reset_token_usage,
     get_token_usage,
+    extract_search_queries,
+    extract_market_probabilities,
 )
 
 from forecasting_tools import MetaculusApi
@@ -396,6 +398,7 @@ class ForecastingAgent:
         today_str: str,
         planner_text: str,
         research_memo: str,
+        market_priors: list[dict] = None,
     ) -> str:
         """
         Single-call, lightly-structured iterative forecast.
@@ -408,6 +411,24 @@ class ForecastingAgent:
         FINAL_PROBABILITY line in section 5. It may also flag where
         additional web retrieval would be valuable.
         """
+        # Format market priors section if available
+        market_priors_text = ""
+        if market_priors:
+            priors_lines = []
+            for p in market_priors:
+                priors_lines.append(f"- {p['source'].title()}: {p['probability']:.1%}")
+            market_priors_text = f"""
+            IMPORTANT - PREDICTION MARKET / COMMUNITY PRIORS:
+            The following prediction market or community forecasts were found in the research:
+            {chr(10).join(priors_lines)}
+            
+            You MUST treat these as strong Bayesian priors. Unless you have specific, concrete
+            evidence that justifies a significant deviation, your forecast should be within
+            ~10 percentage points of these community estimates. If you deviate significantly,
+            you MUST explicitly explain what specific evidence justifies the deviation.
+            Prediction markets and crowd forecasts are typically well-calibrated.
+            """
+        
         prompt = clean_indents(
             f"""
             You are an iterative forecasting agent.
@@ -415,6 +436,7 @@ class ForecastingAgent:
             You have:
             - A forecasting question
             - Today's date
+            {market_priors_text}
 
             Your job is to perform an interative forecasting process, where you the planner, searcher,
             researcher, synthesizer, forecaster, and critic. you may go back and forth between these roles 
@@ -428,6 +450,8 @@ class ForecastingAgent:
               search process and queries explicit. 
             - End with a final probability forecast in a fixed format. include a 1-3 sentence summary rationale.
             - think in steps and be explicit about your reasoning at each step
+            - CRITICAL: If prediction market or community forecasts are provided above, use them as your
+              starting anchor and only adjust based on concrete evidence.
 
             You can move between, and revisit as needed:
             - Decomposing / clarifying the question
@@ -463,6 +487,8 @@ class ForecastingAgent:
             ## 2. Outside view
             - Reference classes and analogues: ...
             - Base-rate prior (0-1, rough): ...
+            - IMPORTANT: If market/community priors are available, explicitly state them here 
+              and use them as your starting point.
 
             ## 3. Inside view
             - Key mechanisms / gates: ...
@@ -479,6 +505,7 @@ class ForecastingAgent:
             ## 5. Final forecast
             - FINAL_PROBABILITY (0-1): ...
             - 1-3 sentence rationale: ...
+            - If deviating significantly from market/community priors, explain why.
 
             ## 6. Optional: further information you would want
             - Briefly note any additional web searches or specific data you would request
@@ -560,9 +587,8 @@ class ForecastingAgent:
                 logger.info("Agent indicates research is sufficient")
                 break
 
-            # Extract queries from response
-            queries = [line.strip() for line in response.split('\n') if line.strip() and not line.startswith('#')]
-            queries = [q for q in queries if len(q) > 10 and '?' not in q[:3]][:3]  # Filter and limit
+            # Extract queries from response using robust parser
+            queries = extract_search_queries(response)
 
             if not queries:
                 logger.info("No valid follow-up queries found, proceeding to forecast")
@@ -600,12 +626,20 @@ class ForecastingAgent:
         final_research_memo = "\n\n".join(all_research)
         self._last_research_memo = final_research_memo # Store for logging
 
+        # Extract market/community priors from research for anchoring
+        market_priors = extract_market_probabilities(final_research_memo)
+        if market_priors:
+            logger.info(f"Found market/community priors: {market_priors}")
+        else:
+            logger.info("No market/community priors found in research")
+
         # Generate final forecast with all research
         agent_output = await self._iterative_forecast(
             question=question,
             today_str=today_str,
             planner_text=planner_text,
             research_memo=final_research_memo,
+            market_priors=market_priors,
         )
 
         return AgentForecastResult(

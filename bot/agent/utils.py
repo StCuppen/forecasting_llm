@@ -54,6 +54,159 @@ def clean_indents(text: str) -> str:
             
     return '\n'.join(cleaned_lines).strip()
 
+
+def extract_search_queries(response_text: str) -> list[str]:
+    """Extract clean search queries from LLM response text.
+    
+    Filters out:
+    - Reasoning text with markdown bold formatting (**...**)
+    - Meta-commentary about needing information
+    - Lines that are too long to be queries (>150 chars)
+    - Lines starting with common reasoning prefixes
+    
+    Args:
+        response_text: Raw LLM response asking for more research
+        
+    Returns:
+        List of clean, valid search queries
+    """
+    queries = []
+    
+    # Reasoning prefixes to skip
+    skip_prefixes = [
+        "i need", "i'm ", "i am ", "i think", "i'll ", "i will",
+        "we need", "we should", "let me", "deciding", "evaluating",
+        "considering", "determining", "gathering", "identifying",
+        "the ", "this ", "since ", "because ", "so,", "yes,", "no,",
+        "**", "##", "#",
+    ]
+    
+    # Skip patterns (regex-like checks)
+    skip_contains = [
+        "**",  # Bold markdown = reasoning, not a query
+        "need to", "should ", "would ", "could ",
+        "information is", "more info", "enough info",
+        "suggest", "provide", "specific web search",
+    ]
+    
+    for line in response_text.split('\n'):
+        line = line.strip()
+        
+        # Skip empty or too short
+        if not line or len(line) < 15:
+            continue
+            
+        # Skip if too long (likely reasoning, not a query)
+        if len(line) > 150:
+            continue
+        
+        # Strip leading bullet/dash/number
+        if line.startswith('- '):
+            line = line[2:].strip()
+        elif line.startswith('* '):
+            line = line[2:].strip()
+        elif len(line) > 2 and line[0].isdigit() and line[1] in '.):':
+            line = line[2:].strip()
+        elif len(line) > 3 and line[0].isdigit() and line[1].isdigit() and line[2] in '.):':
+            line = line[3:].strip()
+            
+        # Strip quotes
+        if line.startswith('"') and line.endswith('"'):
+            line = line[1:-1].strip()
+        if line.startswith("'") and line.endswith("'"):
+            line = line[1:-1].strip()
+            
+        # Skip if starts with reasoning prefix
+        line_lower = line.lower()
+        if any(line_lower.startswith(prefix) for prefix in skip_prefixes):
+            continue
+            
+        # Skip if contains reasoning patterns
+        if any(pattern in line_lower for pattern in skip_contains):
+            continue
+            
+        # Skip if it's mostly punctuation or formatting
+        alpha_ratio = sum(1 for c in line if c.isalpha()) / max(len(line), 1)
+        if alpha_ratio < 0.5:
+            continue
+            
+        # Valid query candidate
+        if len(line) >= 15:
+            queries.append(line)
+    
+    # Return at most 3 queries
+    return queries[:3]
+
+
+def extract_market_probabilities(text: str) -> list[dict]:
+    """Extract prediction market/forecast probabilities from research text.
+    
+    Looks for patterns like:
+    - "Metaculus community: 7%"
+    - "Manifold: 15%"  
+    - "Polymarket odds: 0.12"
+    - "community prediction is 8%"
+    
+    Returns:
+        List of dicts with 'source' and 'probability' keys
+    """
+    import re
+    
+    priors = []
+    
+    # Common patterns for probabilities
+    patterns = [
+        # "Metaculus: 7%" or "community: 7%"
+        r'(?:metaculus|manifold|polymarket|predictit|community|crowd|forecast)\s*(?:prediction|odds|probability|forecast)?[:\s]+(\d+(?:\.\d+)?)\s*%',
+        # "7% on Metaculus"
+        r'(\d+(?:\.\d+)?)\s*%\s+(?:on\s+)?(?:metaculus|manifold|polymarket)',
+        # "probability of 0.07" near market names
+        r'(?:metaculus|manifold|polymarket).*?(?:probability|odds)[:\s]+(?:of\s+)?(\d*\.\d+)',
+        # "0.07 probability" after market name
+        r'(?:metaculus|manifold|polymarket).*?(\d*\.\d+)\s*(?:probability|odds)',
+    ]
+    
+    text_lower = text.lower()
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, text_lower):
+            try:
+                prob_str = match.group(1)
+                prob = float(prob_str)
+                
+                # Convert percentage to decimal if needed
+                if prob > 1:
+                    prob = prob / 100
+                    
+                # Sanity check
+                if 0 < prob < 1:
+                    # Try to identify source
+                    source = "unknown"
+                    context = text_lower[max(0, match.start()-50):match.end()+50]
+                    if "metaculus" in context:
+                        source = "metaculus"
+                    elif "manifold" in context:
+                        source = "manifold"
+                    elif "polymarket" in context:
+                        source = "polymarket"
+                    elif "community" in context:
+                        source = "community"
+                        
+                    priors.append({"source": source, "probability": prob})
+            except (ValueError, IndexError):
+                continue
+                
+    # Deduplicate by source, keeping first found
+    seen_sources = set()
+    unique_priors = []
+    for p in priors:
+        if p["source"] not in seen_sources:
+            seen_sources.add(p["source"])
+            unique_priors.append(p)
+            
+    return unique_priors
+
+
 def extract_json_from_response(response_text: str) -> dict:
     """Robust JSON extraction from LLM responses.
     

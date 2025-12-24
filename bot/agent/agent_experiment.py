@@ -12,11 +12,6 @@ dotenv.load_dotenv()
 from .planner import make_search_plan
 from .retrieval import perform_research
 from .utils import (
-    SerperClient,
-    TavilyClient,
-    SonarClient,
-    BraveClient,
-    LangSearchClient,
     ExaClient,
     call_openrouter_llm,
     clean_indents,
@@ -575,12 +570,23 @@ class ForecastingAgent:
 
             logger.info(f"Agent requested {len(queries)} follow-up queries: {queries}")
 
-            # Execute follow-up research
+            # Execute follow-up research using Exa
             try:
+                if self.exa_client is None:
+                    logger.warning("Exa client not available for follow-up research")
+                    break
+                    
                 followup_results = []
                 for query in queries:
-                    serper_results = await self.serper_client.search(query, num_results=3)
-                    followup_results.append(f"Query: {query}\n{serper_results}")
+                    exa_results = await self.exa_client.search(query, num_results=5)
+                    # Format results nicely
+                    formatted = []
+                    for r in exa_results[:5]:
+                        title = r.get("title", "Untitled")
+                        url = r.get("url", "")
+                        content = r.get("content", "")[:500]  # Truncate for brevity
+                        formatted.append(f"- {title} ({url})\n  {content}")
+                    followup_results.append(f"Query: {query}\n" + "\n".join(formatted))
 
                 followup_memo = "\n\n".join(followup_results)
                 all_research.append(f"# Follow-up Research (Iteration {iteration + 2})\n\n{followup_memo}")

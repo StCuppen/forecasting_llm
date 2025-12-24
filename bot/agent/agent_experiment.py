@@ -74,24 +74,19 @@ class ForecastingAgent:
         self.model_name = model_name
         self.reasoning_effort = reasoning_effort
         
-        # Minimal retrieval stack reusing existing clients.
-        try:
-            self.serper_client = SerperClient()
-        except ValueError:
-            self.serper_client = None
-            logger.warning("SerperClient not initialized (SERPER_API_KEY missing).")
-        
-        # Primary search: Exa.ai (AI-native search with full content)
+        # Exa is now the sole search provider
         exa_key = os.getenv("EXA_API_KEY")
         if exa_key:
             self.exa_client: Optional[ExaClient] = ExaClient(
                 api_key=exa_key,
                 max_results=10,
             )
-            logger.info(">>> Exa.ai ENABLED as primary search provider (with full content). <<<")
+            logger.info(">>> Exa.ai ENABLED as sole search provider. <<<")
         else:
-            logger.warning("EXA_API_KEY not set; Exa disabled. Using Serper as fallback.")
+            logger.warning("EXA_API_KEY not set; Exa disabled.")
             self.exa_client = None
+
+        self.serper_client = None
 
         # Deprecated providers - kept for backwards compatibility
         self.brave_client = None

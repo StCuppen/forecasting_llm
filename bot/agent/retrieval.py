@@ -176,9 +176,6 @@ async def multi_provider_search(
     else:
         secondary_results_lists = [None] * len(classified)
 
-        primary_results_lists = [None] * len(classified)
-        secondary_results_lists = await run_secondary()
-
     raw_hits: List[RawHit] = []
 
     # 3. Normalize Primary (Exa) results (top-5 per query, includes full content)

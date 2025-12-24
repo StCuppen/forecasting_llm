@@ -58,7 +58,7 @@ from forecasting_tools import (
     ReasonedPrediction,
 )
 
-from bot.agent.utils import SerperClient, TavilyClient, SonarClient, BraveClient, reset_token_usage, get_token_usage
+from bot.agent.utils import ExaClient, SerperClient, TavilyClient, SonarClient, BraveClient, reset_token_usage, get_token_usage
 from bot.agent.agent_experiment import run_ensemble_forecast
 
 # Set up logging
@@ -147,37 +147,24 @@ class TemplateForecaster(ForecastBot):
         
         # Cache for research text blocks
         self._research_cache: dict[str, str] = {}
-        self.serper_client = SerperClient()
         
-        # Brave Search (optional)
-        brave_key = os.getenv("BRAVE_API_KEY")
-        if brave_key:
-            self.brave_client: Optional[BraveClient] = BraveClient(api_key=brave_key)
-            logger.info("Brave Search enabled.")
+        # Exa is now the sole search provider
+        exa_key = os.getenv("EXA_API_KEY")
+        if exa_key:
+            self.exa_client = ExaClient(api_key=exa_key)
+            logger.info("Exa.ai enabled as sole search provider.")
         else:
-            self.brave_client = None
-            logger.info("Brave Search disabled.")
+            self.exa_client = None
+            logger.warning("EXA_API_KEY not set; Exa disabled.")
 
-        # Tavily for additional web search (optional if key missing)
-        tavily_key = os.getenv("TAVILY_API_KEY")
-        if tavily_key:
-            self.tavily_client: Optional[TavilyClient] = TavilyClient(
-                api_key=tavily_key,
-                max_results=5,
-                search_depth="advanced",
-            )
-        else:
-            logger.warning("TAVILY_API_KEY not set; Tavily disabled.")
-            self.tavily_client = None
+        # Disable others as per user request
+        self.serper_client = None
+        self.brave_client = None
+        self.tavily_client = None
+        self.sonar_client = None
 
-        # Sonar (Perplexity via OpenRouter) for optional synthesis/compression
-        try:
-            self.sonar_client: Optional[SonarClient] = SonarClient()
-        except Exception:
-            logger.warning("SonarClient not initialized (OPENROUTER_API_KEY required). Continuing without Sonar.")
-            self.sonar_client = None
+        logger.info("TemplateForecaster initialized (Search provider: Exa)")
 
-        logger.info("TemplateForecaster initialized (Multi-provider retrieval: Serper + Tavily + Sonar)")
 
     @staticmethod
     def log_report_summary(

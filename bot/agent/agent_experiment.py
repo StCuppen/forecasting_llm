@@ -531,7 +531,7 @@ class ForecastingAgent:
         )
         return text
 
-    async def run_iterative(self, question: str, max_iterations: int = 3, community_prior: float = None) -> AgentForecastResult:
+    async def run_iterative(self, question: str, max_iterations: int = 2, community_prior: float = None) -> AgentForecastResult:
         """
         Run the agent with iterative research capability.
 
@@ -544,7 +544,7 @@ class ForecastingAgent:
 
         Args:
             question: The forecasting question
-            max_iterations: Maximum research iterations (default 3)
+            max_iterations: Maximum research iterations (default 2, reduced from 3 to minimize failures)
             community_prior: Metaculus/market community prediction (0-1) to use as anchor
         """
         today_str = datetime.utcnow().date().isoformat()
@@ -552,6 +552,10 @@ class ForecastingAgent:
         # Initial research pass
         planner_text, research_memo = await self.find_information(question, today_str)
         all_research = [research_memo]
+        
+        # Track first successful forecast for fallback
+        first_successful_forecast: Optional[str] = None
+        first_successful_probability: Optional[float] = None
 
         # Iterative research loop
         for iteration in range(max_iterations - 1):  # -1 because we already did one pass
@@ -573,15 +577,25 @@ class ForecastingAgent:
                 If YES, provide 1-3 specific web search queries (one per line).
                 If NO, respond with exactly: "READY_FOR_FORECAST"
 
-                Your response:
+                Your response (be brief, max 100 words):
             """)
 
-            response = await self._llm(
-                followup_prompt,
-                max_tokens=200,
-                temperature=0.3,
-                usage_label="agent:check_research_needs"
-            )
+            try:
+                response = await self._llm(
+                    followup_prompt,
+                    max_tokens=10000,  # Generous limit to give reasoning models plenty of room
+                    temperature=0.3,
+                    usage_label="agent:check_research_needs"
+                )
+                
+                # Handle empty response (common with reasoning models hitting token limits)
+                if not response or not response.strip():
+                    logger.warning("Empty response from research check, proceeding to forecast")
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"Research check call failed: {e}, proceeding to forecast")
+                break
 
             # Check if agent is ready
             if "READY_FOR_FORECAST" in response.upper():
@@ -644,13 +658,40 @@ class ForecastingAgent:
             logger.info("No market/community priors found for anchoring")
 
         # Generate final forecast with all research
-        agent_output = await self._iterative_forecast(
-            question=question,
-            today_str=today_str,
-            planner_text=planner_text,
-            research_memo=final_research_memo,
-            market_priors=market_priors,
-        )
+        try:
+            agent_output = await self._iterative_forecast(
+                question=question,
+                today_str=today_str,
+                planner_text=planner_text,
+                research_memo=final_research_memo,
+                market_priors=market_priors,
+            )
+            
+            # Validate we got a real response
+            if agent_output and agent_output.strip():
+                # Extract and store the first successful probability for potential fallback
+                if first_successful_forecast is None:
+                    first_successful_forecast = agent_output
+                    first_successful_probability = extract_probability_from_forecast(agent_output)
+                    if first_successful_probability != 0.5:  # 0.5 is the default fallback
+                        logger.info(f"First successful forecast captured: {first_successful_probability:.1%}")
+            else:
+                logger.warning("Empty forecast response received")
+                # Use fallback if available
+                if first_successful_forecast:
+                    logger.info(f"Using fallback from first successful iteration: {first_successful_probability:.1%}")
+                    agent_output = first_successful_forecast
+                else:
+                    agent_output = f"Forecast generation failed. Community prior: {community_prior:.1%}" if community_prior else "Forecast generation failed."
+                    
+        except Exception as e:
+            logger.error(f"Forecast generation failed: {e}")
+            # Use fallback if available
+            if first_successful_forecast:
+                logger.info(f"Using fallback from first successful iteration: {first_successful_probability:.1%}")
+                agent_output = first_successful_forecast
+            else:
+                agent_output = f"Forecast generation failed: {e}. Community prior: {community_prior:.1%}" if community_prior else f"Forecast generation failed: {e}"
 
         return AgentForecastResult(
             question=question,
@@ -768,13 +809,19 @@ async def run_ensemble_forecast(
         - individual_results: list[dict]
     """
     if models is None:
-        # Simplified single-model setup: GPT-5 mini (no reasoning_effort - causes empty responses)
+        # Two-model ensemble with reasoning enabled
         models = [
             {
                 "name": "openai/gpt-5-mini",
-                "reasoning_effort": None,  # Don't use reasoning - causes token budget issues
-                "max_tokens": 50000,
-                "label": "GPT-5 Mini"
+                "reasoning_effort": "medium",  # Enable reasoning for better forecasts
+                "max_tokens": 100000,
+                "label": "GPT-5 Mini (Reasoning)"
+            },
+            {
+                "name": "google/gemini-3-flash-preview",
+                "reasoning_effort": "medium",  # Enable reasoning for better forecasts
+                "max_tokens": 100000,
+                "label": "Gemini 3 Flash (Reasoning)"
             },
         ]
 
@@ -835,9 +882,13 @@ PREDICTION: {result.probability:.1%}
     # Compute Average
     if not results:
         print("No successful forecasts.")
+        # Use community prior as fallback if available, otherwise default to 0.5
+        fallback_prob = community_prior if community_prior is not None else 0.5
+        summary = f"All models failed. Using community prior: {fallback_prob:.1%}" if community_prior else "All models failed."
+        logger.warning(f"All models failed, using fallback probability: {fallback_prob:.1%}")
         return {
-            "final_probability": 0.5,
-            "summary_text": "All models failed.",
+            "final_probability": fallback_prob,
+            "summary_text": summary,
             "full_log": full_log_content,
             "individual_results": []
         }

@@ -411,118 +411,66 @@ class ForecastingAgent:
         FINAL_PROBABILITY line in section 5. It may also flag where
         additional web retrieval would be valuable.
         """
-        # Format market priors section if available
+        # Format market priors as informational context (not anchoring rules)
         market_priors_text = ""
         if market_priors:
             priors_lines = []
             for p in market_priors:
                 priors_lines.append(f"- {p['source'].title()}: {p['probability']:.1%}")
             market_priors_text = f"""
-            IMPORTANT - PREDICTION MARKET / COMMUNITY PRIORS:
-            The following prediction market or community forecasts were found in the research:
+            CONTEXT - Prediction market/community forecasts found in research:
             {chr(10).join(priors_lines)}
             
-            You MUST treat these as strong Bayesian priors. Unless you have specific, concrete
-            evidence that justifies a significant deviation, your forecast should be within
-            ~10 percentage points of these community estimates. If you deviate significantly,
-            you MUST explicitly explain what specific evidence justifies the deviation.
-            Prediction markets and crowd forecasts are typically well-calibrated.
+            Note: These are provided as additional data points. You should consider them
+            but form your own independent judgment based on the evidence in the research memo.
+            If your analysis leads to a different conclusion, that's fine - explain your reasoning.
             """
         
         prompt = clean_indents(
             f"""
-            You are an iterative forecasting agent.
+            You are a superforecaster making a probabilistic prediction.
 
             You have:
             - A forecasting question
-            - Today's date
+            - Today's date: {today_str}
+            - Detailed research gathered from web searches
             {market_priors_text}
 
-            Your job is to perform an interative forecasting process, where you the planner, searcher,
-            researcher, synthesizer, forecaster, and critic. you may go back and forth between these roles 
-            as needed to arrive at a well-reasoned and calibrated final forecast
-            - Base factual claims only on your research.
-            - Make it very explicit which parts are outside view, inside view, uncertainties and scenarios.
-            - Write out your reasoning steps, not just conclusions, so that a superforecater colleague can follow
-             and inspect and refine your thought process.
-            - If you think important factual gaps remain that could be resolved by more web research,
-              say so explicitly and propose concrete follow-up search queries which you execute.make your 
-              search process and queries explicit. 
-            - End with a final probability forecast in a fixed format. include a 1-3 sentence summary rationale.
-            - think in steps and be explicit about your reasoning at each step
-            - CRITICAL: If prediction market or community forecasts are provided above, use them as your
-              starting anchor and only adjust based on concrete evidence.
+            YOUR TASK: Analyze the research thoroughly and produce your best probability estimate.
+            
+            Key principles:
+            1. BASE YOUR FORECAST ON THE EVIDENCE in the research memo, not on market priors
+            2. Think step-by-step through the key factors that determine the outcome
+            3. Be explicit about your reasoning - show your work
+            4. Consider what would need to happen for the event to occur vs not occur
+            5. Estimate probabilities based on the actual state of the world described in the research
 
-            You can move between, and revisit as needed:
-            - Decomposing / clarifying the question
-            - making relevant search queries
-            - Skimming and re-skimming the research memo
-            - Developing an outside view (reference classes, historical analogues, base rates)
-            - Making inside-view adjustments (mechanisms, actors, incentives, constraints)
-            - Doing scenario decomposition with probabilities
-            - Updating your final forecast
+            Structure your response as follows:
 
-            Recommended but light output structure (you may merge or rename sections 0–4
-            if that helps your reasoning, but KEEP section 5 exactly as written):
+            # FORECAST
 
-            # AGENT FORECAST
+            ## 1. Question Understanding
+            - What exactly needs to happen for YES?
+            - What is the time horizon?
+            - What is the current state?
 
-            ## 0. Plan / approach
-            - Brief note on how you will tackle this forecast.
+            ## 2. Key Evidence from Research
+            - List the most important facts from the research memo
+            - What does the evidence tell us about the current situation?
 
-            ## 1. Question & resolution
-            - Paraphrase: ...
-            - Resolution: ...
-            - Time horizon: ...
+            ## 3. Analysis
+            - What are the key factors that will determine the outcome?
+            - What would need to happen for YES? How likely is each step?
+            - What would need to happen for NO? How likely is that path?
 
-
-         # 3. information needs. 
-         identify the key information needs. 
-         these should be based on your analysis of the question and subquestions. 
-         if later on you update your understanding of the key infoprmation needs based
-         on developing the forecast and steps following after this point, you may go back and 
-         generate more queries. 
-
-
-            ## 2. Outside view
-            - Reference classes and analogues: ...
-            - Base-rate prior (0-1, rough): ...
-            - IMPORTANT: If market/community priors are available, explicitly state them here 
-              and use them as your starting point.
-
-            ## 3. Inside view
-            - Key mechanisms / gates: ...
-            - Upward pressures vs outside view: ...
-            - Downward pressures vs outside view: ...
-            - Inside-view adjusted band (0-1, rough): ...
-
-            ## 4. Scenario decomposition
-            - Scenario 1 (p = ...): ...
-            - Scenario 2 (p = ...): ...
-            - Scenario 3 (p = ...): ...
-            (Probabilities must be between 0 and 1 and sum to 1.0 within rounding; up to 5 scenarios.)
-
-            ## 5. Final forecast
-            - FINAL_PROBABILITY (0-1): ...
-            - 1-3 sentence rationale: ...
-            - If deviating significantly from market/community priors, explain why.
-
-            ## 6. Optional: further information you would want
-            - Briefly note any additional web searches or specific data you would request
-              if you could loop back to the retrieval step. List concrete example queries.
-
-            You are encouraged to iterate mentally between sections 1–4 and revise your
-            views as you go; only the numbers and rationale in section 5 are "binding".
+            ## 4. Probability Estimate
+            - FINAL_PROBABILITY (0-1): [your estimate]
+            - Reasoning: [1-3 sentences explaining your number]
 
             Question:
             {question}
 
-            Today: {today_str}
-
-            Planner notes (optional context; you may skim or ignore):
-            {planner_text}
-
-            Research memo (factual basis; do not contradict this):
+            Research memo (this is your primary evidence source):
             {research_memo}
             """
         )
@@ -889,6 +837,7 @@ PREDICTION: {result.probability:.1%}
         return {
             "final_probability": fallback_prob,
             "summary_text": summary,
+            "full_reasoning": summary,
             "full_log": full_log_content,
             "individual_results": []
         }
@@ -900,13 +849,24 @@ PREDICTION: {result.probability:.1%}
     print(f"FINAL ENSEMBLE PREDICTION: {avg_prob:.1%}")
     print(f"{'='*60}")
 
-    # Create summary for Metaculus
+    # Create compact summary
     summary_lines = [f"Ensemble Prediction: {avg_prob:.1%}"]
     summary_lines.append("Individual Models:")
     for r in results:
         summary_lines.append(f"- {r['config']['label']}: {r['result'].probability:.1%}")
     
     summary_text = "\n".join(summary_lines)
+    
+    # Create full reasoning text including all model explanations
+    full_reasoning_parts = [f"# Ensemble Forecast: {avg_prob:.1%}\n"]
+    for r in results:
+        model_name = r['config']['label']
+        model_prob = r['result'].probability
+        model_explanation = r['result'].explanation or "No explanation available"
+        full_reasoning_parts.append(f"## {model_name}: {model_prob:.1%}\n\n{model_explanation}\n")
+    
+    full_reasoning = "\n---\n\n".join(full_reasoning_parts)
+    
     full_log_content += f"\n\n{'='*60}\nSUMMARY\n{'='*60}\n{summary_text}\n"
 
     # Log file already saved above
@@ -956,6 +916,7 @@ PREDICTION: {result.probability:.1%}
     return {
         "final_probability": avg_prob,
         "summary_text": summary_text,
+        "full_reasoning": full_reasoning,
         "full_log": full_log_content,
         "individual_results": results
     }

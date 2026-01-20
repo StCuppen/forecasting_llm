@@ -17,9 +17,11 @@ from .utils import (
     clean_indents,
     reset_token_usage,
     get_token_usage,
+    record_token_usage,
     extract_search_queries,
     extract_market_probabilities,
 )
+from .prompts import FORECASTER_CONTEXT, REACT_SYSTEM_PROMPT
 
 from forecasting_tools import MetaculusApi
 
@@ -48,6 +50,26 @@ class AgentForecastOutput:
     """Simplified output for external consumers."""
     probability: float
     explanation: str
+    # Optional structured metrics
+    search_count: int = 0
+    sources: list = None  # List of SourceInfo dicts
+    token_usage: dict = None
+    
+    def __post_init__(self):
+        if self.sources is None:
+            self.sources = []
+        if self.token_usage is None:
+            self.token_usage = {}
+
+
+@dataclass
+class SourceInfo:
+    """Tracking info for a consulted source."""
+    url: str
+    title: str
+    date: str = ""
+    quality: str = "Medium"  # High, Medium, Low
+    snippet: str = ""
 
 
 class ForecastingAgent:
@@ -665,20 +687,386 @@ class ForecastingAgent:
 
         return AgentForecastOutput(probability=probability, explanation=explanation)
 
+    async def _llm_conversation(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int = 8000,
+        temperature: float = 0.5,
+        usage_label: Optional[str] = None,
+    ) -> tuple[str, dict]:
+        """
+        Call LLM with conversation history (list of messages).
+        
+        Returns:
+            tuple of (response_text, usage_dict)
+        """
+        import httpx
+        
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY not found")
+        
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        usage = result.get("usage", {})
+        content = ""
+        if "choices" in result and len(result["choices"]) > 0:
+            message = result["choices"][0].get("message", {}) or {}
+            content = (message.get("content") or "").strip()
+            # Fallback to reasoning if content empty
+            if not content:
+                content = (message.get("reasoning") or "").strip()
+        
+        return content, usage
+
+    async def run_react_agent(
+        self,
+        question: str,
+        community_prior: float = None,
+        max_searches: int = 30,
+        max_tokens_total: int = 75000,
+    ) -> AgentForecastOutput:
+        """
+        ReAct-style iterative agent: search, reason, forecast in unified loop.
+        
+        The model can issue SEARCH("query") actions at any time.
+        It iterates until it outputs FINAL_FORECAST or hits limits.
+        
+        Args:
+            question: Forecasting question text
+            community_prior: Optional community/market prior (0-1)
+            max_searches: Maximum number of search actions (default 30)
+            max_tokens_total: Token budget per model (default 75k)
+        
+        Returns:
+            AgentForecastOutput with probability and full explanation
+        """
+        from .utils import clean_indents
+        import json
+        
+        today_str = datetime.utcnow().date().isoformat()
+        
+        # Set up logging directory
+        logs_dir = "forecasts/react_logs"
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_model = self.model_name.replace("/", "_").replace(":", "_")
+        log_file = f"{logs_dir}/{timestamp}_{safe_model}.md"
+        
+        # Build the system prompt using structured template from prompts.py
+        prior_text = ""
+        if community_prior is not None:
+            prior_text = f"\nCONTEXT: Metaculus community prediction is {community_prior:.1%}. Consider this as one data point but form your own judgment.\n"
+        
+        system_prompt = REACT_SYSTEM_PROMPT.format(
+            forecaster_context=FORECASTER_CONTEXT,
+            question=question,
+            today=today_str,
+            prior_text=prior_text,
+        )
+        
+        messages = [{"role": "user", "content": system_prompt}]
+        
+        search_count = 0
+        total_tokens_used = 0
+        prompt_tokens_used = 0
+        completion_tokens_used = 0
+        all_searches = []
+        all_sources = []  # Track all sources with full metadata
+        iteration = 0
+        max_iterations = 5  # Capped at 5 iterations for efficiency
+        
+        # Initialize log content
+        log_content = f"""# ReAct Forecasting Agent Log
+
+**Model**: {self.model_name}
+**Question**: {question}
+**Timestamp**: {timestamp}
+**Community Prior**: {community_prior if community_prior else 'None'}
+
+---
+
+## System Prompt
+
+{system_prompt}
+
+---
+
+## Agent Conversation
+
+"""
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Check token budget
+            if total_tokens_used >= max_tokens_total:
+                logger.warning(f"Token budget exhausted ({total_tokens_used}/{max_tokens_total})")
+                log_content += f"\n\n**[SYSTEM] Token budget exhausted ({total_tokens_used}/{max_tokens_total})**\n"
+                break
+            
+            # Check search limit
+            if search_count >= max_searches:
+                logger.info(f"Search limit reached ({search_count}/{max_searches}), prompting for final forecast")
+                messages.append({
+                    "role": "user",
+                    "content": "You have used all available searches. Please provide your FINAL_FORECAST now based on the information gathered."
+                })
+                log_content += f"\n### User (Search limit)\n\nYou have used all available searches. Please provide your FINAL_FORECAST now.\n"
+            
+            try:
+                response, usage = await self._llm_conversation(
+                    messages,
+                    max_tokens=8000,
+                    temperature=0.5,
+                    usage_label=f"react:iter{iteration}"
+                )
+                
+                # Track token usage
+                total_tokens_used += usage.get("total_tokens", 0)
+                prompt_tokens_used += usage.get("prompt_tokens", 0)
+                completion_tokens_used += usage.get("completion_tokens", 0)
+                logger.info(f"Iteration {iteration}: {usage.get('total_tokens', 0)} tokens, total: {total_tokens_used}")
+                
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                log_content += f"\n\n**[ERROR] LLM call failed: {e}**\n"
+                break
+            
+            if not response:
+                logger.warning("Empty response from model")
+                messages.append({"role": "user", "content": "Please continue with your analysis."})
+                continue
+            
+            # Log the assistant response
+            log_content += f"\n### Assistant (Iteration {iteration}, {usage.get('total_tokens', 0)} tokens)\n\n{response}\n"
+            
+            # Add assistant response to history
+            messages.append({"role": "assistant", "content": response})
+            
+            # Check for FINAL_FORECAST
+            if "FINAL_FORECAST" in response:
+                logger.info(f"Final forecast received after {iteration} iterations, {search_count} searches")
+                probability = extract_probability_from_forecast(response)
+                
+                # Build full explanation from conversation
+                full_explanation = self._build_explanation_from_conversation(messages, all_searches)
+                
+                # Finalize and save log
+                log_content += f"""
+---
+
+## Summary
+
+- **Iterations**: {iteration}
+- **Searches**: {search_count}
+- **Total Tokens**: {total_tokens_used}
+- **Final Probability**: {probability:.1%}
+
+## Search Queries Used
+
+"""
+                for i, s in enumerate(all_searches, 1):
+                    log_content += f"{i}. {s['query']}\n"
+                
+                # Save log file
+                with open(log_file, "w", encoding="utf-8") as f:
+                    f.write(log_content)
+                logger.info(f"Log saved to: {log_file}")
+                
+                return AgentForecastOutput(
+                    probability=probability,
+                    explanation=full_explanation,
+                    search_count=search_count,
+                    sources=all_sources,
+                    token_usage={
+                        "prompt": prompt_tokens_used,
+                        "completion": completion_tokens_used,
+                        "total": total_tokens_used,
+                    }
+                )
+            
+            # Check for SEARCH action
+            search_match = re.search(r'SEARCH\s*\(\s*["\']([^"\']+)["\']\s*\)', response)
+            if search_match and search_count < max_searches:
+                query = search_match.group(1)
+                search_count += 1
+                logger.info(f"Search {search_count}/{max_searches}: {query}")
+                log_content += f"\n### Search {search_count}: `{query}`\n"
+                
+                try:
+                    if self.exa_client:
+                        results = await self.exa_client.search(query, num_results=8)
+                        # Track sources with full metadata
+                        for r in results:
+                            all_sources.append({
+                                "url": r.get("url", ""),
+                                "title": r.get("title", "Untitled")[:80],
+                                "date": r.get("published_date", "")[:10] if r.get("published_date") else "",
+                                "quality": "Medium",  # Default, could be enhanced
+                                "snippet": r.get("content", "")[:200] if r.get("content") else "",
+                            })
+                        formatted_results = self._format_search_results(results, query)
+                        all_searches.append({"query": query, "results": formatted_results, "source_count": len(results)})
+                        log_content += f"\n{formatted_results[:2000]}...\n" if len(formatted_results) > 2000 else f"\n{formatted_results}\n"
+                        messages.append({
+                            "role": "user",
+                            "content": f"Search results for '{query}':\n\n{formatted_results}\n\nContinue your analysis. You may search again or provide your FINAL_FORECAST when ready."
+                        })
+                    else:
+                        log_content += "\n**[Search failed - no client available]**\n"
+                        messages.append({
+                            "role": "user",
+                            "content": f"Search failed (no search client available). Continue with available information or try a different approach."
+                        })
+                except Exception as e:
+                    logger.warning(f"Search failed: {e}")
+                    log_content += f"\n**[Search failed: {str(e)[:100]}]**\n"
+                    messages.append({
+                        "role": "user",
+                        "content": f"Search for '{query}' failed: {str(e)[:100]}. Continue with available information or try a different query."
+                    })
+                continue
+            
+            # No action found - prompt model to continue
+            if search_count < max_searches:
+                messages.append({
+                    "role": "user",
+                    "content": "Continue your analysis. Use SEARCH(\"query\") to find more information, or provide your FINAL_FORECAST when ready."
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": "Please provide your FINAL_FORECAST now."
+                })
+        
+        # Fallback: extract best probability from conversation
+        logger.warning(f"Agent did not produce final forecast after {iteration} iterations")
+        full_text = "\n".join([m["content"] for m in messages if m["role"] == "assistant"])
+        probability = extract_probability_from_forecast(full_text)
+        
+        # Save log even on fallback
+        log_content += f"""
+---
+
+## Summary (FALLBACK - No explicit FINAL_FORECAST)
+
+- **Iterations**: {iteration}
+- **Searches**: {search_count}
+- **Total Tokens**: {total_tokens_used}
+- **Extracted Probability**: {probability:.1%}
+
+## Search Queries Used
+
+"""
+        for i, s in enumerate(all_searches, 1):
+            log_content += f"{i}. {s['query']}\n"
+        
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(log_content)
+        logger.info(f"Log saved to: {log_file}")
+        
+        return AgentForecastOutput(
+            probability=probability,
+            explanation=f"[Agent reached iteration limit]\n\n{full_text[-5000:]}",
+            search_count=search_count,
+            sources=all_sources,
+            token_usage={
+                "prompt": prompt_tokens_used,
+                "completion": completion_tokens_used,
+                "total": total_tokens_used,
+            }
+        )
+    
+    def _format_search_results(self, results: list, query: str) -> str:
+        """Format Exa search results for the agent."""
+        if not results:
+            return "No results found."
+        
+        formatted = []
+        for i, r in enumerate(results[:8], 1):
+            title = r.get("title", "Untitled")
+            url = r.get("url", "")
+            content = r.get("text", r.get("content", ""))[:1500]  # Truncate long content
+            formatted.append(f"**[{i}] {title}**\nURL: {url}\n{content}\n")
+        
+        return "\n---\n".join(formatted)
+    
+    def _build_explanation_from_conversation(self, messages: list, searches: list) -> str:
+        """Build a coherent explanation from the agent's conversation history."""
+        parts = []
+        
+        # Add search summary
+        if searches:
+            parts.append(f"## Research ({len(searches)} searches)")
+            for s in searches:
+                parts.append(f"- {s['query']}")
+            parts.append("")
+        
+        # Add key reasoning from assistant messages
+        parts.append("## Agent Reasoning")
+        for msg in messages:
+            if msg["role"] == "assistant":
+                content = msg["content"]
+                # NO TRUNCATION - show full reasoning
+                parts.append(content)
+                parts.append("\n---\n")
+        
+        return "\n".join(parts)
+
+    async def run_forecast_react(self, question: str, community_prior: float = None) -> AgentForecastOutput:
+        """
+        Convenience wrapper: run ReAct agent for forecasting.
+        This is the new preferred entry point.
+        """
+        return await self.run_react_agent(question, community_prior=community_prior)
+
 
 def extract_probability_from_forecast(forecast_text: str) -> float:
     """Extract probability from agent forecast text.
 
-    Looks for patterns like:
-    - FINAL_PROBABILITY (0-1): 0.57
-    - FINAL_PROBABILITY: 0.57
-    - Final probability: 57%
-    - **Final Probability**: 0.35
-    - Probability: 35%
-    - P = 0.35
-    - 35% probability
+    Priority order:
+    1. TOTAL P(YES) from pathway computation table
+    2. FINAL_FORECAST Probability line
+    3. Various other probability formats
     """
-    # Try FINAL_PROBABILITY (0-1): format first
+    # FIRST: Look for TOTAL P(YES) from pathway computation table
+    # Match patterns like "**TOTAL P(YES)** | **13%**" or "TOTAL | 13%"
+    total_match = re.search(r'\*?\*?TOTAL[^|]*\*?\*?\s*\|\s*\*?\*?([0-9]+(?:\.[0-9]+)?)\s*%?\*?\*?', forecast_text, re.IGNORECASE)
+    if total_match:
+        prob = float(total_match.group(1))
+        logger.info(f"Extracted probability from TOTAL row: {prob}%")
+        return prob / 100 if prob > 1 else prob
+    
+    # SECOND: Look for "Probability: X" after FINAL_FORECAST
+    final_section_match = re.search(r'FINAL_FORECAST.*?Probability:\s*\[?([0-9.]+)\]?', forecast_text, re.IGNORECASE | re.DOTALL)
+    if final_section_match:
+        prob = float(final_section_match.group(1))
+        logger.info(f"Extracted probability from FINAL_FORECAST section: {prob}")
+        return prob / 100 if prob > 1 else prob
+    
+    # Try FINAL_PROBABILITY (0-1): format
     match = re.search(r'FINAL_PROBABILITY\s*\(0-1\)\s*:\s*([0-9.]+)', forecast_text, re.IGNORECASE)
     if match:
         return float(match.group(1))
@@ -739,6 +1127,7 @@ async def run_ensemble_forecast(
     models: list[dict] = None,
     publish_to_metaculus: bool = False,
     community_prior: float = None,
+    use_react: bool = True,
 ) -> dict:
     """
     Run an ensemble of forecasting agents on a question.
@@ -748,6 +1137,7 @@ async def run_ensemble_forecast(
         models: List of model configs. If None, uses default ensemble.
         publish_to_metaculus: Whether to post the result to Metaculus.
         community_prior: Metaculus community prediction (0-1) to use as anchor.
+        use_react: If True, use new ReAct-style iterative agent. If False, use legacy agent.
         
     Returns:
         dict containing:
@@ -760,10 +1150,10 @@ async def run_ensemble_forecast(
         # Two-model ensemble with reasoning enabled
         models = [
             {
-                "name": "openai/gpt-5-mini",
+                "name": "xiaomi/mimo-v2-flash:free",
                 "reasoning_effort": "medium",  # Enable reasoning for better forecasts
                 "max_tokens": 100000,
-                "label": "GPT-5 Mini (Reasoning)"
+                "label": "MiMo v2 Flash"
             },
             {
                 "name": "google/gemini-3-flash-preview",
@@ -773,7 +1163,8 @@ async def run_ensemble_forecast(
             },
         ]
 
-    print(f"Starting Multi-Model Ensemble Forecast for: {question}")
+    agent_type = "ReAct" if use_react else "Legacy"
+    print(f"Starting Multi-Model Ensemble Forecast ({agent_type}) for: {question}")
     print("-" * 60)
 
     results = []
@@ -781,22 +1172,47 @@ async def run_ensemble_forecast(
     os.makedirs(logs_dir, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     
-    full_log_content = f"# FORECAST LOG - {timestamp}\n\nQuestion: {question}\n\n"
+    full_log_content = f"# FORECAST LOG - {timestamp}\nAgent Type: {agent_type}\n\nQuestion: {question}\n\n"
 
     for config in models:
-        print(f"\n>>> Running {config['label']} ({config['name']})...")
+        print(f"\n>>> Running {config['label']} ({config['name']}) with {agent_type} agent...")
         try:
             agent = ForecastingAgent(
                 model_name=config["name"],
                 reasoning_effort=config.get("reasoning_effort")
             )
             
-            result = await agent.run_forecast(question, community_prior=community_prior)
+            # Use ReAct agent (new) or legacy agent
+            if use_react:
+                result = await agent.run_react_agent(question, community_prior=community_prior)
+            else:
+                result = await agent.run_forecast(question, community_prior=community_prior)
             
             results.append({
                 "config": config,
                 "result": result
             })
+            
+            # Build sources table for this model
+            sources_table = ""
+            if hasattr(result, 'sources') and result.sources:
+                sources_table = "\n--- SOURCES CONSULTED ---\n"
+                sources_table += "| # | Title | URL | Date |\n|---|-------|-----|------|\n"
+                for i, src in enumerate(result.sources[:15], 1):  # Limit to 15 sources
+                    title = src.get('title', 'N/A')[:50]
+                    url = src.get('url', 'N/A')
+                    date = src.get('date', 'N/A')
+                    sources_table += f"| {i} | {title} | {url} | {date} |\n"
+            
+            # Build metrics block
+            metrics_block = "\n--- METRICS ---\n"
+            if hasattr(result, 'search_count'):
+                metrics_block += f"Searches: {result.search_count}\n"
+            if hasattr(result, 'sources') and result.sources:
+                metrics_block += f"Sources: {len(result.sources)}\n"
+            if hasattr(result, 'token_usage') and result.token_usage:
+                tu = result.token_usage
+                metrics_block += f"Tokens: prompt={tu.get('prompt', 0):,}, completion={tu.get('completion', 0):,}, total={tu.get('total', 0):,}\n"
             
             log_section = f"""
 {'='*60}
@@ -806,12 +1222,10 @@ MAX_TOKENS: {config['max_tokens']}
 {'='*60}
 
 PREDICTION: {result.probability:.1%}
-
+{sources_table}
+{metrics_block}
 --- EXPLANATION ---
 {result.explanation}
-
---- RESEARCH MEMO ---
-{getattr(agent, '_last_research_memo', 'Not available')}
 """
             full_log_content += log_section
             print(f"   Result: {result.probability:.1%}")

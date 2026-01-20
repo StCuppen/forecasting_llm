@@ -950,15 +950,37 @@ class ForecastingAgent:
                 continue
             
             # No action found - prompt model to continue
-            if search_count < max_searches:
+            # Force completion more aggressively as iterations increase
+            if iteration >= max_iterations - 1:
+                # LAST ITERATION - force completion NOW
                 messages.append({
                     "role": "user",
-                    "content": "Continue your analysis. Use SEARCH(\"query\") to find more information, or provide your FINAL_FORECAST when ready."
+                    "content": """STOP. You have run out of iterations. You MUST output your FINAL_FORECAST NOW.
+
+Based on all information gathered, output EXACTLY this format:
+
+### 5. PROBABILITY COMPUTATION
+| Pathway | Probability |
+|---------|-------------|
+| [Path1] | X% |
+| [Path2] | Y% |
+| **TOTAL P(YES)** | **Z%** |
+
+FINAL_FORECAST
+Probability: [Z - same as TOTAL above]
+One-line summary: [Your reasoning]
+
+OUTPUT NOW. Do not search again. Do not explain. Just give the table and FINAL_FORECAST."""
+                })
+            elif search_count >= max_searches:
+                messages.append({
+                    "role": "user",
+                    "content": "You've reached the search limit. Please provide your FINAL_FORECAST now with the pathway probability table."
                 })
             else:
                 messages.append({
                     "role": "user",
-                    "content": "Please provide your FINAL_FORECAST now."
+                    "content": "Continue your analysis. Use SEARCH(\"query\") to find more information, or provide your FINAL_FORECAST when ready."
                 })
         
         # Fallback: extract best probability from conversation
@@ -1052,19 +1074,30 @@ def extract_probability_from_forecast(forecast_text: str) -> float:
     3. Various other probability formats
     """
     # FIRST: Look for TOTAL P(YES) from pathway computation table
-    # Match patterns like "**TOTAL P(YES)** | **13%**" or "TOTAL | 13%"
-    total_match = re.search(r'\*?\*?TOTAL[^|]*\*?\*?\s*\|\s*\*?\*?([0-9]+(?:\.[0-9]+)?)\s*%?\*?\*?', forecast_text, re.IGNORECASE)
+    # Match patterns like "**TOTAL P(YES)** | **13%**" or "TOTAL | 0.9%"
+    total_match = re.search(r'\*?\*?TOTAL[^|]*\*?\*?\s*\|\s*\*?\*?([0-9]+(?:\.[0-9]+)?)\s*(%?)\*?\*?', forecast_text, re.IGNORECASE)
     if total_match:
         prob = float(total_match.group(1))
-        logger.info(f"Extracted probability from TOTAL row: {prob}%")
-        return prob / 100 if prob > 1 else prob
+        has_percent = total_match.group(2) == '%'
+        logger.info(f"Extracted probability from TOTAL row: {prob}{'%' if has_percent else ''}")
+        # If it has a % sign, it's definitely a percentage (divide by 100)
+        # If no % and value > 1, it's also a percentage
+        # If no % and value <= 1, it's already a decimal
+        if has_percent or prob > 1:
+            return prob / 100
+        else:
+            return prob
     
-    # SECOND: Look for "Probability: X" after FINAL_FORECAST
-    final_section_match = re.search(r'FINAL_FORECAST.*?Probability:\s*\[?([0-9.]+)\]?', forecast_text, re.IGNORECASE | re.DOTALL)
+    # SECOND: Look for "Probability: X" after FINAL_FORECAST  
+    final_section_match = re.search(r'FINAL_FORECAST.*?Probability:\s*\[?([0-9.]+)\s*(%?)\]?', forecast_text, re.IGNORECASE | re.DOTALL)
     if final_section_match:
         prob = float(final_section_match.group(1))
-        logger.info(f"Extracted probability from FINAL_FORECAST section: {prob}")
-        return prob / 100 if prob > 1 else prob
+        has_percent = final_section_match.group(2) == '%'
+        logger.info(f"Extracted probability from FINAL_FORECAST section: {prob}{'%' if has_percent else ''}")
+        if has_percent or prob > 1:
+            return prob / 100
+        else:
+            return prob
     
     # Try FINAL_PROBABILITY (0-1): format
     match = re.search(r'FINAL_PROBABILITY\s*\(0-1\)\s*:\s*([0-9.]+)', forecast_text, re.IGNORECASE)

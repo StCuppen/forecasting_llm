@@ -9,9 +9,10 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
-  schedule:
-    # Run every 15 minutes
-    - cron: "*/15 * * * *"
+  # DISABLED: GitHub cron is unreliable at midnight UTC
+  # Using cron-job.org external trigger instead
+  # schedule:
+  #   - cron: "*/15 * * * *"
 
 concurrency:
   group: ${{ github.workflow }}

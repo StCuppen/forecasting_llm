@@ -1194,6 +1194,12 @@ async def run_ensemble_forecast(
                 "max_tokens": 100000,
                 "label": "Gemini 3 Flash (Reasoning)"
             },
+            {
+                "name": "deepseek/deepseek-v3.2",
+                "reasoning_effort": None,  # DeepSeek has built-in reasoning
+                "max_tokens": 32000,
+                "label": "DeepSeek v3.2"
+            },
         ]
 
     agent_type = "ReAct" if use_react else "Legacy"

@@ -1,0 +1,100 @@
+name: Run MiniBench
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_repost:
+        description: "Force re-post on previously forecasted questions"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+  # MiniBench: Questions open for 4 days, poll every 30 mins
+  # Less aggressive than main tournament since questions stay open longer
+  schedule:
+    - cron: "*/30 * * * *"
+
+concurrency:
+  group: minibench-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+      SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+      PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/pypoetry
+            .venv
+          key: poetry-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install dependencies
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry install --no-interaction --no-ansi
+
+      - name: Run bot (MiniBench)
+        shell: bash
+        run: |
+          set -o pipefail
+          EXTRA_FLAGS=""
+          if [[ "${{ github.event.inputs.force_repost }}" == "true" ]]; then
+            EXTRA_FLAGS="--force-repost"
+          fi
+          poetry run python bot/main_forecast_pipeline.py --mode tournament --tournament minibench ${EXTRA_FLAGS} | tee bot.log
+
+      - name: Summarize results
+        if: always()
+        shell: bash
+        run: |
+          # Extract last retrieved count if present
+          retrieved=$(grep -Eo "Retrieved [0-9]+ questions from tournament" bot.log | awk '{print $2}' | tail -n1 || true)
+          retrieved=${retrieved:-0}
+
+          # Count submission attempts
+          posted=$(grep -E "Submission Attempt: posting forecast" -c bot.log || true)
+
+          {
+            echo "## MiniBench Bot Results"
+            echo ""
+            echo "**Retrieved questions:** ${retrieved}"
+            echo "**Predictions posted:** ${posted}"
+            echo ""
+            echo "**Question URLs:**"
+            grep -Eo "https://www\.metaculus\.com/questions/[0-9]+/" bot.log 2>/dev/null | sort -u || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minibench-bot-log
+          path: |
+            bot.log
+            forecastingoutput/

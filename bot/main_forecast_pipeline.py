@@ -359,6 +359,12 @@ def main():
         help="Force re-post on previously forecasted questions"
     )
     parser.add_argument(
+        "--tournament",
+        type=str,
+        default=None,
+        help="Tournament ID or slug (default: main AI competition). Examples: 'minibench', 'aibq2'"
+    )
+    parser.add_argument(
         "--output-file",
         type=str,
         default="./forecastingoutput/forecast_reports.json",
@@ -392,9 +398,13 @@ def main():
 
     # Run based on mode
     if run_mode == "tournament":
+        # Determine tournament ID
+        tournament_id = args.tournament if args.tournament else MetaculusApi.CURRENT_AI_COMPETITION_ID
+        logger.info(f"Targeting tournament: {tournament_id}")
+        
         forecast_reports = asyncio.run(
             template_bot.scan_tournament(
-                MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                tournament_id, return_exceptions=True
             )
         )
     elif run_mode == "test_questions":

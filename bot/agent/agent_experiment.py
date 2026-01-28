@@ -501,7 +501,7 @@ class ForecastingAgent:
         )
         return text
 
-    async def run_iterative(self, question: str, max_iterations: int = 2, community_prior: float = None) -> AgentForecastResult:
+    async def run_iterative(self, question: str, max_iterations: int = 5, community_prior: float = None) -> AgentForecastResult:
         """
         Run the agent with iterative research capability.
 
@@ -514,7 +514,7 @@ class ForecastingAgent:
 
         Args:
             question: The forecasting question
-            max_iterations: Maximum research iterations (default 2, reduced from 3 to minimize failures)
+            max_iterations: Maximum research iterations (default 5 for thorough research)
             community_prior: Metaculus/market community prediction (0-1) to use as anchor
         """
         today_str = datetime.utcnow().date().isoformat()
@@ -1183,10 +1183,10 @@ async def run_ensemble_forecast(
         # Two-model ensemble with reasoning enabled
         models = [
             {
-                "name": "openai/gpt-4o-mini",
-                "reasoning_effort": None, 
+                "name": "openai/gpt-5-mini",
+                "reasoning_effort": "medium",  # Enable reasoning for better forecasts
                 "max_tokens": 16000,
-                "label": "GPT-4o Mini"
+                "label": "GPT-5 Mini (Reasoning)"
             },
             {
                 "name": "google/gemini-3-flash-preview",
@@ -1296,11 +1296,33 @@ PREDICTION: {result.probability:.1%}
     print(f"FINAL ENSEMBLE PREDICTION: {avg_prob:.1%}")
     print(f"{'='*60}")
 
-    # Create compact summary
-    summary_lines = [f"Ensemble Prediction: {avg_prob:.1%}"]
-    summary_lines.append("Individual Models:")
+    # Create expanded summary with full reasoning chain (~300 words)
+    summary_lines = [f"# Ensemble Forecast: {avg_prob:.1%}\n"]
+    summary_lines.append(f"**Prediction Range:** {min(probs):.1%} - {max(probs):.1%}\n")
+    summary_lines.append("## Model Predictions\n")
     for r in results:
-        summary_lines.append(f"- {r['config']['label']}: {r['result'].probability:.1%}")
+        summary_lines.append(f"- **{r['config']['label']}**: {r['result'].probability:.1%}")
+    
+    summary_lines.append("\n## Reasoning Summary\n")
+    # Include key reasoning from each model (first 500 chars each)
+    for r in results:
+        model_name = r['config']['label']
+        model_explanation = r['result'].explanation or "No explanation available"
+        # Extract first paragraph or key reasoning
+        first_section = model_explanation[:800].split('\n\n')[0] if model_explanation else ""
+        summary_lines.append(f"**{model_name} Analysis:**\n{first_section}...\n")
+    
+    summary_lines.append("\n## Conclusion\n")
+    summary_lines.append(f"Based on {len(results)} models using iterative research with up to 5 search iterations, ")
+    summary_lines.append(f"the ensemble prediction is **{avg_prob:.1%}**. ")
+    if len(probs) > 1:
+        spread = max(probs) - min(probs)
+        if spread < 0.1:
+            summary_lines.append("Models showed strong agreement.")
+        elif spread < 0.2:
+            summary_lines.append("Models showed moderate agreement.")
+        else:
+            summary_lines.append("Models showed significant disagreement, suggesting high uncertainty.")
     
     summary_text = "\n".join(summary_lines)
     
@@ -1360,12 +1382,18 @@ PREDICTION: {result.probability:.1%}
             except Exception as e:
                 logger.error(f"Failed to post to Metaculus: {e}")
 
+    # Get token usage
+    token_usage_data = get_token_usage()
+    total_tokens = sum(v.get('total_tokens', 0) for v in token_usage_data.values()) if token_usage_data else 0
+    
     return {
         "final_probability": avg_prob,
         "summary_text": summary_text,
         "full_reasoning": full_reasoning,
         "full_log": full_log_content,
-        "individual_results": results
+        "individual_results": results,
+        "token_usage": token_usage_data,
+        "total_tokens": total_tokens
     }
 
 

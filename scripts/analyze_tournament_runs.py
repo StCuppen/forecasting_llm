@@ -67,9 +67,11 @@ def _parse_logs_zip(content: bytes) -> dict[str, int]:
     z = zipfile.ZipFile(io.BytesIO(content))
     # Patterns correspond to the repo's current logging + workflow summary parsing.
     fetched_re = re.compile(r"Fetched (\d+) questions \(Open \+ Upcoming\)")
+    retrieved_legacy_re = re.compile(r"Retrieved (\d+) questions from tournament", re.IGNORECASE)
     found_upcoming_re = re.compile(r"FOUND (\d+) UPCOMING QUESTIONS")
     found_open_re = re.compile(r"Found (\d+) OPEN questions", re.IGNORECASE)
-    attempt_re = re.compile(r"Submission Attempt: posting forecast")
+    # Require "| url=" so we don't accidentally match workflow grep commands.
+    attempt_re = re.compile(r"Submission Attempt: posting forecast\s+\|\s+url=", re.IGNORECASE)
     skip_re = re.compile(r"Submission Skipped:")
     err_re = re.compile(r"Error while processing question url:", re.IGNORECASE)
 
@@ -86,6 +88,8 @@ def _parse_logs_zip(content: bytes) -> dict[str, int]:
         txt = z.read(name).decode("utf-8", errors="ignore")
 
         for m in fetched_re.finditer(txt):
+            fetched_total = max(fetched_total, int(m.group(1)))
+        for m in retrieved_legacy_re.finditer(txt):
             fetched_total = max(fetched_total, int(m.group(1)))
         for m in found_upcoming_re.finditer(txt):
             announced_upcoming = max(announced_upcoming, int(m.group(1)))
@@ -112,9 +116,10 @@ def _parse_artifact_zip(content: bytes) -> dict[str, int]:
     """
     z = zipfile.ZipFile(io.BytesIO(content))
     fetched_re = re.compile(r"Fetched (\d+) questions \(Open \+ Upcoming\)")
+    retrieved_legacy_re = re.compile(r"Retrieved (\d+) questions from tournament", re.IGNORECASE)
     found_upcoming_re = re.compile(r"FOUND (\d+) UPCOMING QUESTIONS")
     found_open_re = re.compile(r"Found (\d+) OPEN questions", re.IGNORECASE)
-    attempt_re = re.compile(r"Submission Attempt: posting forecast")
+    attempt_re = re.compile(r"Submission Attempt: posting forecast\s+\|\s+url=", re.IGNORECASE)
     skip_re = re.compile(r"Submission Skipped:")
     err_re = re.compile(r"Error while processing question url:", re.IGNORECASE)
 
@@ -132,6 +137,8 @@ def _parse_artifact_zip(content: bytes) -> dict[str, int]:
         txt = z.read(name).decode("utf-8", errors="ignore")
 
         for m in fetched_re.finditer(txt):
+            fetched_total = max(fetched_total, int(m.group(1)))
+        for m in retrieved_legacy_re.finditer(txt):
             fetched_total = max(fetched_total, int(m.group(1)))
         for m in found_upcoming_re.finditer(txt):
             announced_upcoming = max(announced_upcoming, int(m.group(1)))

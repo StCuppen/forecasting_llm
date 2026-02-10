@@ -3,6 +3,11 @@ name: Run Tournament
 on:
   workflow_dispatch:
     inputs:
+      tournament:
+        description: "Tournament slug or ID (e.g. metaculus-cup-spring-2026, spring-aib-2026)"
+        required: false
+        default: "metaculus-cup-spring-2026"
+        type: string
       force_repost:
         description: "Force re-post on previously forecasted questions"
         required: false
@@ -67,15 +72,23 @@ jobs:
           if [[ "${{ github.event.inputs.force_repost }}" == "true" ]]; then
             EXTRA_FLAGS="--force-repost"
           fi
-          poetry run python bot/main_forecast_pipeline.py --mode tournament ${EXTRA_FLAGS} | tee bot.log
+          TOURNAMENT_INPUT="${{ github.event.inputs.tournament }}"
+          if [[ -z "$TOURNAMENT_INPUT" ]]; then
+            TOURNAMENT_INPUT="metaculus-cup-spring-2026"
+          fi
+          poetry run python bot/main_forecast_pipeline.py --mode tournament --tournament "$TOURNAMENT_INPUT" ${EXTRA_FLAGS} 2>&1 | tee bot.log
 
       - name: Summarize results
         if: always()
         shell: bash
         run: |
-          # Extract last retrieved count if present
-          retrieved=$(grep -Eo "Retrieved [0-9]+ questions from tournament" bot.log | awk '{print $2}' | tail -n1 || true)
+          # Extract last fetched count if present
+          retrieved=$(grep -Eo "Fetched [0-9]+ questions \\(Open \\+ Upcoming\\)" bot.log | awk '{print $2}' | tail -n1 || true)
           retrieved=${retrieved:-0}
+
+          # Extract supported open binary count from the bot log (if present)
+          supported_open=$(grep -Eo "Found [0-9]+ OPEN questions \\([0-9]+ supported binary\\)" bot.log | tail -n1 | sed -E 's/.*\\(([0-9]+) supported binary\\).*/\\1/' || true)
+          supported_open=${supported_open:-0}
 
           # Count submission attempts
           posted=$(grep -E "Submission Attempt: posting forecast" -c bot.log || true)
@@ -84,15 +97,25 @@ jobs:
             echo "## Tournament Bot Results"
             echo ""
             echo "**Retrieved questions:** ${retrieved}"
+            echo "**Supported open binary questions:** ${supported_open}"
             echo "**Predictions posted:** ${posted}"
             echo ""
             echo "**Question URLs:**"
             grep -Eo "https://www\.metaculus\.com/questions/[0-9]+/" bot.log 2>/dev/null | sort -u || true
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # If we had supported open questions but didn't even attempt a submission, fail the run.
+          # This prevents silent green runs that make zero predictions.
+          if [[ "${supported_open}" -gt 0 && "${posted}" -eq 0 ]]; then
+            echo "::error::Supported open binary questions found (${supported_open}) but zero submission attempts were logged."
+            exit 1
+          fi
+
       - name: Upload log artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bot-log
-          path: bot.log
+          path: |
+            bot.log
+            forecastingoutput/

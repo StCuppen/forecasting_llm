@@ -2,6 +2,12 @@
 benchmarks/
 sandbox.py
 
+# Local outputs / logs
+forecastingoutput/
+runs.json
+run_log.txt
+.claude/
+
 
 ### General gitignore ###
 

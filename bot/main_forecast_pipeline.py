@@ -14,7 +14,7 @@ import hashlib
 import logging
 import os
 import json
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
 from datetime import datetime
 import numpy as np
 
@@ -56,6 +56,8 @@ from forecasting_tools import (
     NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
+    ApiFilter,
+    QuestionState,
 )
 
 from bot.agent.utils import ExaClient, SerperClient, TavilyClient, SonarClient, BraveClient, reset_token_usage, get_token_usage
@@ -249,7 +251,11 @@ class TemplateForecaster(ForecastBot):
                 community_prior=community_prior,
             )
             
-            final_prob = result["final_probability"]
+            final_prob = float(result["final_probability"])
+            # Metaculus forecast endpoint rejects extreme values (<0.01 or >0.99).
+            # Clamp here so a single model/pathological output doesn't make the whole
+            # question fail to post.
+            final_prob = max(0.01, min(0.99, final_prob))
             # Use full reasoning instead of just summary so complete analysis is posted
             full_reasoning = result.get("full_reasoning", result["summary_text"])
             
@@ -283,6 +289,72 @@ class TemplateForecaster(ForecastBot):
         logger.warning("Numeric questions not supported in clean pipeline")
         raise NotImplementedError("Numeric forecasting not implemented in clean pipeline")
 
+    async def scan_tournament(
+        self,
+        tournament_id: int | str,
+        return_exceptions: bool = False,
+    ) -> list[Any]:
+        """
+        Smart scan: Fetch OPEN and UPCOMING questions.
+        - Open: Forecast and submit (if not already done).
+        - Upcoming: Log for visibility (preparation step).
+        """
+        logger.info(f"Starting Smart Scan for tournament {tournament_id}...")
+        
+        # 1. Fetch Open and Upcoming
+        api_filter = ApiFilter(
+            allowed_tournaments=[tournament_id],
+            allowed_statuses=["open", "upcoming"],
+        )
+        questions = await MetaculusApi.get_questions_matching_filter(api_filter)
+        logger.info(f"Fetched {len(questions)} questions (Open + Upcoming)")
+        
+        open_qs = []
+        upcoming_qs = []
+        
+        for q in questions:
+            if q.state == QuestionState.OPEN:
+                open_qs.append(q)
+            elif q.state == QuestionState.UPCOMING:
+                upcoming_qs.append(q)
+        
+        # 2. Process Upcoming (Visibility)
+        if upcoming_qs:
+            logger.info("--------------------------------------------------")
+            logger.info(f"FOUND {len(upcoming_qs)} UPCOMING QUESTIONS:")
+            for q in upcoming_qs:
+                opens_at = q.open_time.strftime('%Y-%m-%d %H:%M UTC') if q.open_time else "Unknown"
+                logger.info(f" - [UPCOMING] {q.question_text}")
+                logger.info(f"   Opens: {opens_at} | URL: {q.page_url}")
+            logger.info("--------------------------------------------------")
+            
+        # 3. Process Open (Forecast)
+        if open_qs:
+            # Only binary is supported right now; other types will raise NotImplementedError
+            # and still allow the run to exit successfully (since we allow per-question exceptions).
+            supported_open_qs: list[BinaryQuestion] = [
+                q for q in open_qs if isinstance(q, BinaryQuestion)
+            ]
+            skipped = len(open_qs) - len(supported_open_qs)
+            if skipped:
+                type_counts: dict[str, int] = {}
+                for q in open_qs:
+                    t = getattr(q, "question_type", None) or q.__class__.__name__
+                    type_counts[t] = type_counts.get(t, 0) + 1
+                logger.warning(
+                    f"Skipping {skipped} OPEN non-binary questions (unsupported). Type counts: {type_counts}"
+                )
+
+            logger.info(
+                f"Found {len(open_qs)} OPEN questions ({len(supported_open_qs)} supported binary). Proceeding to forecast..."
+            )
+            if not supported_open_qs:
+                return []
+            return await self.forecast_questions(supported_open_qs, return_exceptions)
+        else:
+            logger.info("No OPEN questions found to forecast.")
+            return []
+
 
 
 # ========================================
@@ -310,9 +382,15 @@ def main():
         help="Force re-post on previously forecasted questions"
     )
     parser.add_argument(
+        "--tournament",
+        type=str,
+        default=None,
+        help="Tournament ID or slug (default: main AI competition). Examples: 'minibench', 'aibq2'"
+    )
+    parser.add_argument(
         "--output-file",
         type=str,
-        default="./forecast_reports.json",
+        default="./forecastingoutput/forecast_reports.json",
         help="Path to save forecast reports"
     )
 
@@ -325,7 +403,7 @@ def main():
         predictions_per_research_report=1,  # 3 models, but treated as 1 ensemble
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
-        folder_to_save_reports_to="./forecast_reports",
+        folder_to_save_reports_to="./forecastingoutput/reports",
         skip_previously_forecasted_questions=True,
     )
 
@@ -343,9 +421,13 @@ def main():
 
     # Run based on mode
     if run_mode == "tournament":
+        # Determine tournament ID
+        tournament_id = args.tournament if args.tournament else MetaculusApi.CURRENT_AI_COMPETITION_ID
+        logger.info(f"Targeting tournament: {tournament_id}")
+        
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+            template_bot.scan_tournament(
+                tournament_id, return_exceptions=True
             )
         )
     elif run_mode == "test_questions":
@@ -400,6 +482,9 @@ def main():
     # Write forecast reports
     try:
         out_path = args.output_file
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         serializable = []
         for r in forecast_reports:
             try:
@@ -419,7 +504,14 @@ def main():
     try:
         publish_flag = bool(getattr(template_bot, 'publish_reports_to_metaculus', False))
         skip_flag = bool(getattr(template_bot, 'skip_previously_forecasted_questions', True))
+        exception_reports = [r for r in forecast_reports if isinstance(r, BaseException)]
+        if exception_reports:
+            logging.error(f"{len(exception_reports)} questions failed during forecasting/posting (see errors below).")
+            for e in exception_reports[:20]:
+                logging.error(f"Question Failed: {type(e).__name__}: {e}")
         for r in forecast_reports:
+            if isinstance(r, BaseException):
+                continue
             q = getattr(r, 'question', None)
             url = getattr(q, 'page_url', None)
             already_forecasted = bool(getattr(q, 'already_forecasted', False)) if q else None

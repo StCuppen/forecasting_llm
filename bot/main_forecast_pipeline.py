@@ -315,6 +315,27 @@ def main():
         default="./forecast_reports.json",
         help="Path to save forecast reports"
     )
+    parser.add_argument(
+        "--tournament-id",
+        type=str,
+        default=os.getenv("TOURNAMENT_ID"),
+        help=(
+            "Tournament ID or slug for tournament mode. "
+            "Defaults to TOURNAMENT_ID env var, else forecasting_tools default."
+        ),
+    )
+    parser.add_argument(
+        "--min-questions",
+        type=int,
+        default=int(os.getenv("MIN_QUESTIONS", "0")),
+        help="Fail run if fewer than this many questions are returned (tournament mode).",
+    )
+    parser.add_argument(
+        "--min-post-attempts",
+        type=int,
+        default=int(os.getenv("MIN_POST_ATTEMPTS", "0")),
+        help="Fail run if fewer than this many post attempts are made.",
+    )
 
     args = parser.parse_args()
     run_mode = args.mode
@@ -337,6 +358,9 @@ def main():
         f"TAVILY={bool(os.getenv('TAVILY_API_KEY'))}"
     )
 
+    selected_tournament_id = args.tournament_id or MetaculusApi.CURRENT_AI_COMPETITION_ID
+    logger.info(f"TOURNAMENT_ID={selected_tournament_id}")
+
     # Apply CLI overrides
     if getattr(args, "force_repost", False):
         template_bot.skip_previously_forecasted_questions = False
@@ -345,7 +369,8 @@ def main():
     if run_mode == "tournament":
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
-                MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                selected_tournament_id,
+                return_exceptions=True,
             )
         )
     elif run_mode == "test_questions":
@@ -379,6 +404,49 @@ def main():
         )
     else:
         raise SystemExit(f"Unknown mode: {run_mode}")
+
+    # Run-level diagnostics and guardrails
+    publish_flag = bool(getattr(template_bot, 'publish_reports_to_metaculus', False))
+    skip_flag = bool(getattr(template_bot, 'skip_previously_forecasted_questions', True))
+
+    successful_reports = [r for r in forecast_reports if not isinstance(r, BaseException)]
+    errored_reports = [r for r in forecast_reports if isinstance(r, BaseException)]
+
+    question_count = len(successful_reports)
+    post_attempt_count = 0
+    skipped_previously_forecasted_count = 0
+    skipped_publish_disabled_count = 0
+
+    for r in successful_reports:
+        q = getattr(r, 'question', None)
+        already_forecasted = bool(getattr(q, 'already_forecasted', False)) if q else False
+        if not publish_flag:
+            skipped_publish_disabled_count += 1
+        elif already_forecasted and skip_flag:
+            skipped_previously_forecasted_count += 1
+        else:
+            post_attempt_count += 1
+
+    logging.info(f"Retrieved {question_count} questions from tournament")
+    logging.info(
+        "Run Stats: "
+        f"total_reports={len(forecast_reports)} | "
+        f"success={question_count} | "
+        f"errors={len(errored_reports)} | "
+        f"post_attempts={post_attempt_count} | "
+        f"skipped_already_forecasted={skipped_previously_forecasted_count} | "
+        f"skipped_publish_disabled={skipped_publish_disabled_count}"
+    )
+
+    if run_mode == "tournament" and args.min_questions > 0 and question_count < args.min_questions:
+        raise SystemExit(
+            f"Retrieved only {question_count} questions, below required minimum {args.min_questions}."
+        )
+
+    if args.min_post_attempts > 0 and post_attempt_count < args.min_post_attempts:
+        raise SystemExit(
+            f"Only {post_attempt_count} post attempts, below required minimum {args.min_post_attempts}."
+        )
 
     # Post-process explanations to drop the default "Report 1 Summary" section
     # and keep only the full RESEARCH block + forecast rationales.
@@ -417,9 +485,7 @@ def main():
 
     # Emit submission logs
     try:
-        publish_flag = bool(getattr(template_bot, 'publish_reports_to_metaculus', False))
-        skip_flag = bool(getattr(template_bot, 'skip_previously_forecasted_questions', True))
-        for r in forecast_reports:
+        for r in successful_reports:
             q = getattr(r, 'question', None)
             url = getattr(q, 'page_url', None)
             already_forecasted = bool(getattr(q, 'already_forecasted', False)) if q else None
@@ -430,6 +496,8 @@ def main():
                 logging.info(f"Submission Skipped: already_forecasted and skip enabled | url={url}")
             else:
                 logging.info(f"Submission Attempt: posting forecast | url={url}")
+        for err in errored_reports:
+            logging.error(f"Forecast report failure: {err}")
     except Exception as e:
         logging.warning(f"Could not emit submission-intent logs: {e}")
 

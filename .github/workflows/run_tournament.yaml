@@ -9,6 +9,21 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      tournament_id:
+        description: "Tournament ID or slug (e.g. metaculus-cup-spring-2026)"
+        required: false
+        default: "metaculus-cup-spring-2026"
+        type: string
+      min_questions:
+        description: "Fail run if fewer questions are retrieved"
+        required: false
+        default: "1"
+        type: string
+      min_post_attempts:
+        description: "Fail run if fewer posting attempts are made"
+        required: false
+        default: "1"
+        type: string
   # DISABLED: GitHub cron is unreliable at midnight UTC
   # Using cron-job.org external trigger instead
   # schedule:
@@ -67,7 +82,15 @@ jobs:
           if [[ "${{ github.event.inputs.force_repost }}" == "true" ]]; then
             EXTRA_FLAGS="--force-repost"
           fi
-          poetry run python bot/main_forecast_pipeline.py --mode tournament ${EXTRA_FLAGS} | tee bot.log
+          TOURNAMENT_ID="${{ github.event.inputs.tournament_id }}"
+          MIN_QUESTIONS="${{ github.event.inputs.min_questions || '1' }}"
+          MIN_POST_ATTEMPTS="${{ github.event.inputs.min_post_attempts || '1' }}"
+          poetry run python bot/main_forecast_pipeline.py \
+            --mode tournament \
+            --tournament-id "${TOURNAMENT_ID}" \
+            --min-questions "${MIN_QUESTIONS}" \
+            --min-post-attempts "${MIN_POST_ATTEMPTS}" \
+            ${EXTRA_FLAGS} 2>&1 | tee bot.log
 
       - name: Summarize results
         if: always()
@@ -79,12 +102,14 @@ jobs:
 
           # Count submission attempts
           posted=$(grep -E "Submission Attempt: posting forecast" -c bot.log || true)
+          failures=$(grep -E "Forecast report failure:" -c bot.log || true)
 
           {
             echo "## Tournament Bot Results"
             echo ""
             echo "**Retrieved questions:** ${retrieved}"
             echo "**Predictions posted:** ${posted}"
+            echo "**Forecast failures:** ${failures}"
             echo ""
             echo "**Question URLs:**"
             grep -Eo "https://www\.metaculus\.com/questions/[0-9]+/" bot.log 2>/dev/null | sort -u || true

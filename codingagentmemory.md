@@ -126,3 +126,9 @@ Posting result:
 ### Additional fixes
 - Metaculus URL enrichment scope bug fixed in ensemble runner (avoid local import shadowing).
 - Comment posting call fixed to use `post_id` for `MetaculusApi.post_question_comment(...)`.
+
+### Workflow Summary Guardrail Fix (2026-02-12, follow-up)
+- GitHub workflow run `21927552614` succeeded end-to-end (run job completed, post_attempts=1).
+- A subsequent run failed in summary step when zero posts were expected because questions were already forecasted.
+- Updated `.github/workflows/run_tournament.yaml` summary logic to parse `skipped_already_forecasted` and avoid false failure when all supported questions were skipped for that reason.
+- The guardrail still fails true silent failures (supported open > 0, posted = 0, and not explained by already-forecasted skips).

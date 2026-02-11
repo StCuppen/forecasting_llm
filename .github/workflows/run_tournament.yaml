@@ -151,6 +151,16 @@ jobs:
           if ! [[ "${posted}" =~ ^[0-9]+$ ]]; then
             posted=0
           fi
+          skipped_prev=$(grep -E "Skipping [0-9]+ previously forecasted questions" bot.log | sed -nE 's/.*Skipping ([0-9]+) previously forecasted questions.*/\1/p' | tail -n1 || true)
+          skipped_prev=${skipped_prev:-0}
+          if ! [[ "${skipped_prev}" =~ ^[0-9]+$ ]]; then
+            skipped_prev=0
+          fi
+          skipped_prev_runstats=$(grep -E "Run Stats:.*skipped_already_forecasted=[0-9]+" bot.log | sed -nE 's/.*skipped_already_forecasted=([0-9]+).*/\1/p' | tail -n1 || true)
+          skipped_prev_runstats=${skipped_prev_runstats:-0}
+          if ! [[ "${skipped_prev_runstats}" =~ ^[0-9]+$ ]]; then
+            skipped_prev_runstats=0
+          fi
           failures=$(grep -E "Forecast report failure:" -c bot.log || true)
 
           {
@@ -159,6 +169,7 @@ jobs:
             echo "**Retrieved questions:** ${retrieved}"
             echo "**Supported open questions:** ${supported_open}"
             echo "**Predictions posted:** ${posted}"
+            echo "**Skipped previously forecasted:** ${skipped_prev_runstats}"
             echo "**Forecast failures:** ${failures}"
             echo ""
             echo "**Question URLs:**"
@@ -168,8 +179,12 @@ jobs:
           # If we had supported open questions but didn't even attempt a submission, fail the run.
           # This prevents silent green runs that make zero predictions.
           if [[ "${supported_open}" -gt 0 && "${posted}" -eq 0 ]]; then
-            echo "::error::Supported open questions found (${supported_open}) but zero submission attempts were logged."
-            exit 1
+            if [[ "${skipped_prev}" -ge "${supported_open}" || "${skipped_prev_runstats}" -ge "${supported_open}" ]]; then
+              echo "All supported open questions were already forecasted; zero submission attempts is expected."
+            else
+              echo "::error::Supported open questions found (${supported_open}) but zero submission attempts were logged."
+              exit 1
+            fi
           fi
 
       - name: Upload log artifact

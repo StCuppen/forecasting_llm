@@ -222,3 +222,4 @@ Run B (after force-finalization guard):
   - Local smoke test confirmed tournament path can complete and post with `post_attempts=1`.
 - Date-awareness verification:
   - Models recognized January 2026 had passed and treated the question as pending publication of January data (not as a future month event).
+- Follow-up workflow fix: summary guard now distinguishes true silent failures from expected skip-only runs (already-forecasted questions), preventing false-red workflow outcomes.

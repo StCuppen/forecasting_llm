@@ -14,6 +14,27 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      tournament_id:
+        description: "Tournament ID or slug (e.g. metaculus-cup-spring-2026)"
+        required: false
+        default: "metaculus-cup-spring-2026"
+        type: string
+      question_types:
+        description: "Question types to process: all supported types, or binary only"
+        required: false
+        default: "all"
+        type: choice
+        options: ["all", "binary"]
+      min_questions:
+        description: "Fail run if fewer questions are retrieved"
+        required: false
+        default: "1"
+        type: string
+      min_post_attempts:
+        description: "Fail run if fewer posting attempts are made"
+        required: false
+        default: "1"
+        type: string
   # DISABLED: GitHub cron is unreliable at midnight UTC
   # Using cron-job.org external trigger instead
   # schedule:
@@ -67,38 +88,64 @@ jobs:
       - name: Run bot (tournament)
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           EXTRA_FLAGS=""
           if [[ "${{ github.event.inputs.force_repost }}" == "true" ]]; then
             EXTRA_FLAGS="--force-repost"
           fi
-          TOURNAMENT_INPUT="${{ github.event.inputs.tournament }}"
-          if [[ -z "$TOURNAMENT_INPUT" ]]; then
-            TOURNAMENT_INPUT="metaculus-cup-spring-2026"
+
+          TOURNAMENT_ID="${{ github.event.inputs.tournament_id }}"
+          if [[ -z "${TOURNAMENT_ID}" ]]; then
+            TOURNAMENT_ID="${{ github.event.inputs.tournament }}"
           fi
-          poetry run python bot/main_forecast_pipeline.py --mode tournament --tournament "$TOURNAMENT_INPUT" ${EXTRA_FLAGS} 2>&1 | tee bot.log
+          if [[ -z "${TOURNAMENT_ID}" ]]; then
+            TOURNAMENT_ID="metaculus-cup-spring-2026"
+          fi
+          QUESTION_TYPES="${{ github.event.inputs.question_types || 'all' }}"
+          MIN_QUESTIONS="${{ github.event.inputs.min_questions || '1' }}"
+          MIN_POST_ATTEMPTS="${{ github.event.inputs.min_post_attempts || '1' }}"
+
+          poetry run python bot/main_forecast_pipeline.py \
+            --mode tournament \
+            --tournament-id "${TOURNAMENT_ID}" \
+            --question-types "${QUESTION_TYPES}" \
+            --min-questions "${MIN_QUESTIONS}" \
+            --min-post-attempts "${MIN_POST_ATTEMPTS}" \
+            ${EXTRA_FLAGS} 2>&1 | tee bot.log
 
       - name: Summarize results
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           # Extract last fetched count if present
-          retrieved=$(grep -Eo "Fetched [0-9]+ questions \\(Open \\+ Upcoming\\)" bot.log | awk '{print $2}' | tail -n1 || true)
+          retrieved=$(grep -E "Fetched [0-9]+ questions \\(Open \\+ Upcoming\\)" bot.log | sed -nE 's/.*Fetched ([0-9]+) questions.*/\1/p' | tail -n1 || true)
+          if [[ -z "${retrieved}" ]]; then
+            retrieved=$(grep -E "Retrieved [0-9]+ questions from tournament" bot.log | sed -nE 's/.*Retrieved ([0-9]+) questions.*/\1/p' | tail -n1 || true)
+          fi
           retrieved=${retrieved:-0}
 
-          # Extract supported open binary count from the bot log (if present)
-          supported_open=$(grep -Eo "Found [0-9]+ OPEN questions \\([0-9]+ supported binary\\)" bot.log | tail -n1 | sed -E 's/.*\\(([0-9]+) supported binary\\).*/\\1/' || true)
+          # Extract supported open count from the bot log (if present)
+          supported_open=$(grep -E "Found [0-9]+ OPEN questions \\([0-9]+ supported" bot.log | sed -nE 's/.*\(([0-9]+) supported.*/\1/p' | tail -n1 || true)
           supported_open=${supported_open:-0}
+          if ! [[ "${supported_open}" =~ ^[0-9]+$ ]]; then
+            supported_open=0
+          fi
 
           # Count submission attempts
           posted=$(grep -E "Submission Attempt: posting forecast" -c bot.log || true)
+          if ! [[ "${posted}" =~ ^[0-9]+$ ]]; then
+            posted=0
+          fi
+          failures=$(grep -E "Forecast report failure:" -c bot.log || true)
 
           {
             echo "## Tournament Bot Results"
             echo ""
             echo "**Retrieved questions:** ${retrieved}"
-            echo "**Supported open binary questions:** ${supported_open}"
+            echo "**Supported open questions:** ${supported_open}"
             echo "**Predictions posted:** ${posted}"
+            echo "**Forecast failures:** ${failures}"
             echo ""
             echo "**Question URLs:**"
             grep -Eo "https://www\.metaculus\.com/questions/[0-9]+/" bot.log 2>/dev/null | sort -u || true
@@ -107,7 +154,7 @@ jobs:
           # If we had supported open questions but didn't even attempt a submission, fail the run.
           # This prevents silent green runs that make zero predictions.
           if [[ "${supported_open}" -gt 0 && "${posted}" -eq 0 ]]; then
-            echo "::error::Supported open binary questions found (${supported_open}) but zero submission attempts were logged."
+            echo "::error::Supported open questions found (${supported_open}) but zero submission attempts were logged."
             exit 1
           fi
 

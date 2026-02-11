@@ -276,22 +276,90 @@ class TemplateForecaster(ForecastBot):
         question: MultipleChoiceQuestion,
         research: str,
     ) -> PredictedOptionList:
-        """Stub implementation for multiple choice questions."""
-        logger.warning("Multiple choice questions not supported in clean pipeline")
-        raise NotImplementedError("Multiple choice forecasting not implemented in clean pipeline")
+        """
+        Forecast multiple choice using a conservative fallback prior.
+
+        We intentionally keep this deterministic and robust so tournament runs can
+        handle non-binary questions without crashing. Better model-based MC
+        forecasting can replace this later.
+        """
+        options = [opt.strip() for opt in question.options if opt and opt.strip()]
+        if not options:
+            raise ValueError("Multiple choice question has no options.")
+
+        base_probability = 1.0 / len(options)
+        predicted_options = [
+            {"option_name": option, "probability": base_probability}
+            for option in options
+        ]
+        # Force exact sum=1.0 to avoid small floating-point drift.
+        if len(predicted_options) > 1:
+            running_sum = sum(item["probability"] for item in predicted_options[:-1])
+            predicted_options[-1]["probability"] = max(0.0, min(1.0, 1.0 - running_sum))
+
+        logger.info(
+            f"Generated fallback multiple-choice forecast (uniform prior) for {len(options)} options."
+        )
+        return PredictedOptionList(predicted_options=predicted_options)
 
     async def _run_forecast_on_numeric(
         self,
         question: NumericQuestion,
         research: str,
     ) -> NumericDistribution:
-        """Stub implementation for numeric questions."""
-        logger.warning("Numeric questions not supported in clean pipeline")
-        raise NotImplementedError("Numeric forecasting not implemented in clean pipeline")
+        """
+        Forecast numeric questions with a bounded fallback distribution.
+
+        This yields a valid, monotonic distribution anchored to the question's
+        declared bounds so numeric questions can be processed safely.
+        """
+        lower = float(question.lower_bound)
+        upper = float(question.upper_bound)
+        if not np.isfinite(lower) or not np.isfinite(upper):
+            raise ValueError(f"Numeric bounds must be finite. lower={lower}, upper={upper}")
+        if upper <= lower:
+            raise ValueError(f"Numeric bounds invalid. lower={lower}, upper={upper}")
+
+        span = upper - lower
+        value_fracs = [0.15, 0.35, 0.50, 0.65, 0.85]
+        percentile_points = [0.10, 0.25, 0.50, 0.75, 0.90]
+        values = [lower + (span * frac) for frac in value_fracs]
+
+        # Ensure strictly increasing values, even in narrow ranges.
+        min_step = max(span * 1e-6, 1e-9)
+        for i in range(1, len(values)):
+            if values[i] <= values[i - 1]:
+                values[i] = values[i - 1] + min_step
+
+        # Keep values inside hard bounds for closed ranges.
+        if not question.open_lower_bound:
+            values[0] = max(values[0], lower + min_step)
+        if not question.open_upper_bound:
+            values[-1] = min(values[-1], upper - min_step)
+        for i in range(1, len(values)):
+            if values[i] <= values[i - 1]:
+                values[i] = values[i - 1] + min_step
+
+        logger.info(
+            "Generated fallback numeric distribution using question bounds "
+            f"[{lower}, {upper}]"
+        )
+        return NumericDistribution(
+            declared_percentiles=[
+                {"value": value, "percentile": percentile}
+                for value, percentile in zip(values, percentile_points)
+            ],
+            open_upper_bound=bool(question.open_upper_bound),
+            open_lower_bound=bool(question.open_lower_bound),
+            upper_bound=upper,
+            lower_bound=lower,
+            zero_point=question.zero_point,
+        )
 
     async def scan_tournament(
         self,
         tournament_id: int | str,
+        question_types: Literal["all", "binary"] = "all",
         return_exceptions: bool = False,
     ) -> list[Any]:
         """
@@ -330,23 +398,29 @@ class TemplateForecaster(ForecastBot):
             
         # 3. Process Open (Forecast)
         if open_qs:
-            # Only binary is supported right now; other types will raise NotImplementedError
-            # and still allow the run to exit successfully (since we allow per-question exceptions).
-            supported_open_qs: list[BinaryQuestion] = [
-                q for q in open_qs if isinstance(q, BinaryQuestion)
-            ]
+            supported_classes = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion)
+            if question_types == "binary":
+                supported_open_qs = [q for q in open_qs if isinstance(q, BinaryQuestion)]
+                support_label = "supported binary"
+            else:
+                supported_open_qs = [q for q in open_qs if isinstance(q, supported_classes)]
+                support_label = "supported types"
+
             skipped = len(open_qs) - len(supported_open_qs)
             if skipped:
                 type_counts: dict[str, int] = {}
                 for q in open_qs:
-                    t = getattr(q, "question_type", None) or q.__class__.__name__
-                    type_counts[t] = type_counts.get(t, 0) + 1
+                    if q not in supported_open_qs:
+                        t = getattr(q, "question_type", None) or q.__class__.__name__
+                        type_counts[t] = type_counts.get(t, 0) + 1
                 logger.warning(
-                    f"Skipping {skipped} OPEN non-binary questions (unsupported). Type counts: {type_counts}"
+                    f"Skipping {skipped} OPEN questions (unsupported for mode={question_types}). "
+                    f"Type counts: {type_counts}"
                 )
 
             logger.info(
-                f"Found {len(open_qs)} OPEN questions ({len(supported_open_qs)} supported binary). Proceeding to forecast..."
+                f"Found {len(open_qs)} OPEN questions ({len(supported_open_qs)} {support_label}). "
+                "Proceeding to forecast..."
             )
             if not supported_open_qs:
                 return []
@@ -393,6 +467,33 @@ def main():
         default="./forecastingoutput/forecast_reports.json",
         help="Path to save forecast reports"
     )
+    parser.add_argument(
+        "--tournament-id",
+        type=str,
+        default=os.getenv("TOURNAMENT_ID"),
+        help=(
+            "Tournament ID or slug for tournament mode. "
+            "Defaults to TOURNAMENT_ID env var, else forecasting_tools default."
+        ),
+    )
+    parser.add_argument(
+        "--min-questions",
+        type=int,
+        default=int(os.getenv("MIN_QUESTIONS", "0")),
+        help="Fail run if fewer than this many questions are returned (tournament mode).",
+    )
+    parser.add_argument(
+        "--min-post-attempts",
+        type=int,
+        default=int(os.getenv("MIN_POST_ATTEMPTS", "0")),
+        help="Fail run if fewer than this many post attempts are made.",
+    )
+    parser.add_argument(
+        "--question-types",
+        choices=["all", "binary"],
+        default=os.getenv("QUESTION_TYPES", "all"),
+        help="Question types to process in tournament mode.",
+    )
 
     args = parser.parse_args()
     run_mode = args.mode
@@ -415,19 +516,27 @@ def main():
         f"TAVILY={bool(os.getenv('TAVILY_API_KEY'))}"
     )
 
+    selected_tournament_id = (
+        args.tournament_id
+        or args.tournament
+        or MetaculusApi.CURRENT_AI_COMPETITION_ID
+    )
+    logger.info(f"TOURNAMENT_ID={selected_tournament_id}")
+
     # Apply CLI overrides
     if getattr(args, "force_repost", False):
         template_bot.skip_previously_forecasted_questions = False
 
     # Run based on mode
     if run_mode == "tournament":
-        # Determine tournament ID
-        tournament_id = args.tournament if args.tournament else MetaculusApi.CURRENT_AI_COMPETITION_ID
-        logger.info(f"Targeting tournament: {tournament_id}")
-        
+        logger.info(
+            f"Targeting tournament: {selected_tournament_id} | question_types={args.question_types}"
+        )
         forecast_reports = asyncio.run(
             template_bot.scan_tournament(
-                tournament_id, return_exceptions=True
+                selected_tournament_id,
+                question_types=args.question_types,
+                return_exceptions=True,
             )
         )
     elif run_mode == "test_questions":
@@ -461,6 +570,49 @@ def main():
         )
     else:
         raise SystemExit(f"Unknown mode: {run_mode}")
+
+    # Run-level diagnostics and guardrails
+    publish_flag = bool(getattr(template_bot, 'publish_reports_to_metaculus', False))
+    skip_flag = bool(getattr(template_bot, 'skip_previously_forecasted_questions', True))
+
+    successful_reports = [r for r in forecast_reports if not isinstance(r, BaseException)]
+    errored_reports = [r for r in forecast_reports if isinstance(r, BaseException)]
+
+    question_count = len(successful_reports)
+    post_attempt_count = 0
+    skipped_previously_forecasted_count = 0
+    skipped_publish_disabled_count = 0
+
+    for r in successful_reports:
+        q = getattr(r, 'question', None)
+        already_forecasted = bool(getattr(q, 'already_forecasted', False)) if q else False
+        if not publish_flag:
+            skipped_publish_disabled_count += 1
+        elif already_forecasted and skip_flag:
+            skipped_previously_forecasted_count += 1
+        else:
+            post_attempt_count += 1
+
+    logging.info(f"Retrieved {question_count} questions from tournament")
+    logging.info(
+        "Run Stats: "
+        f"total_reports={len(forecast_reports)} | "
+        f"success={question_count} | "
+        f"errors={len(errored_reports)} | "
+        f"post_attempts={post_attempt_count} | "
+        f"skipped_already_forecasted={skipped_previously_forecasted_count} | "
+        f"skipped_publish_disabled={skipped_publish_disabled_count}"
+    )
+
+    if run_mode == "tournament" and args.min_questions > 0 and question_count < args.min_questions:
+        raise SystemExit(
+            f"Retrieved only {question_count} questions, below required minimum {args.min_questions}."
+        )
+
+    if args.min_post_attempts > 0 and post_attempt_count < args.min_post_attempts:
+        raise SystemExit(
+            f"Only {post_attempt_count} post attempts, below required minimum {args.min_post_attempts}."
+        )
 
     # Post-process explanations to drop the default "Report 1 Summary" section
     # and keep only the full RESEARCH block + forecast rationales.
@@ -502,16 +654,7 @@ def main():
 
     # Emit submission logs
     try:
-        publish_flag = bool(getattr(template_bot, 'publish_reports_to_metaculus', False))
-        skip_flag = bool(getattr(template_bot, 'skip_previously_forecasted_questions', True))
-        exception_reports = [r for r in forecast_reports if isinstance(r, BaseException)]
-        if exception_reports:
-            logging.error(f"{len(exception_reports)} questions failed during forecasting/posting (see errors below).")
-            for e in exception_reports[:20]:
-                logging.error(f"Question Failed: {type(e).__name__}: {e}")
-        for r in forecast_reports:
-            if isinstance(r, BaseException):
-                continue
+        for r in successful_reports:
             q = getattr(r, 'question', None)
             url = getattr(q, 'page_url', None)
             already_forecasted = bool(getattr(q, 'already_forecasted', False)) if q else None
@@ -522,6 +665,8 @@ def main():
                 logging.info(f"Submission Skipped: already_forecasted and skip enabled | url={url}")
             else:
                 logging.info(f"Submission Attempt: posting forecast | url={url}")
+        for err in errored_reports:
+            logging.error(f"Forecast report failure: {err}")
     except Exception as e:
         logging.warning(f"Could not emit submission-intent logs: {e}")
 

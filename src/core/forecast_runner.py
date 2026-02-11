@@ -128,6 +128,7 @@ def run_forecast_for_question(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "prompt_template_version": "league-v1",
         "forecast_pipeline_version": "v1",
+        "dry_run": dry_run,
         "apply_calibration": apply_calibration,
         "calibrator_version": calibrator_version,
     }

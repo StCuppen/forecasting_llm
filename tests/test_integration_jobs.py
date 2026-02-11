@@ -91,7 +91,9 @@ macro = ["macro"]
             self.assertEqual(forecast_result["forecasted"], 1)
             md_files = list(md_dir.glob("*.md"))
             self.assertEqual(len(md_files), 1)
-            self.assertIn("Feedback Loop Prediction", md_files[0].read_text(encoding="utf-8"))
+            md_text = md_files[0].read_text(encoding="utf-8")
+            self.assertIn("Feedback Loop Prediction", md_text)
+            self.assertIn("Mode: `dry-run`", md_text)
 
             with patch("src.jobs.resolve_due.build_connectors", return_value={"metaculus": fake}):
                 resolve_result = run_resolve_due(config_path=str(cfg))

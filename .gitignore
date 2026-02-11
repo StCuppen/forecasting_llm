@@ -4,6 +4,7 @@ sandbox.py
 
 # Local outputs / logs
 forecastingoutput/
+forecasts/
 runs.json
 run_log.txt
 .claude/

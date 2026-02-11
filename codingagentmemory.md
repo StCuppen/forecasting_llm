@@ -132,3 +132,18 @@ Posting result:
 - A subsequent run failed in summary step when zero posts were expected because questions were already forecasted.
 - Updated `.github/workflows/run_tournament.yaml` summary logic to parse `skipped_already_forecasted` and avoid false failure when all supported questions were skipped for that reason.
 - The guardrail still fails true silent failures (supported open > 0, posted = 0, and not explained by already-forecasted skips).
+
+### Push + Tournament Revalidation (2026-02-12, continuation)
+- Confirmed branch `main` was ahead by 1 commit and pushed latest fix commit:
+  - `c605115 Fix workflow skip-only guardrail and update memory logs`
+  - push result: `ff2f625..c605115  main -> main`
+- Re-ran GitHub workflow after push:
+  - run id: `21927817303`
+  - status: success
+  - key stats from logs:
+    - `Found 8 OPEN questions (4 supported binary)`
+    - `Retrieved 1 questions from tournament`
+    - `Run Stats: total_reports=1 | success=1 | errors=0 | post_attempts=1 | skipped_already_forecasted=0`
+    - `Submission Attempt: posting forecast | url=https://www.metaculus.com/questions/41595`
+- Date-awareness remains validated for the January question:
+  - models treated January 2026 as elapsed and focused on pending publication/official data release.

@@ -9,6 +9,9 @@ This module adds a SQLite-first forecasting league pipeline that:
 5. Updates per-domain ensemble weights online.
 6. Optionally fits weekly calibration models.
 
+V1 guardrail:
+- Rolling weekly prediction cap: `forecast.weekly_prediction_limit` (default `25`).
+
 ## Repository Layout
 
 - `src/connectors/`
@@ -39,6 +42,7 @@ poetry run python -m src.jobs.cli tick --dry-run --config league.toml
 ```
 
 This command runs ingest -> forecast -> resolve -> score -> update and prints a lightweight dashboard.
+It also respects the rolling weekly cap.
 
 ## Job Commands
 

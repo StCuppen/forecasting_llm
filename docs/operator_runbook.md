@@ -18,6 +18,10 @@ Recommended cadence:
 Artifacts:
 - Forecast rationale markdown is written to `predictions/feedback_loop/` for this pipeline.
 
+Limit controls:
+- Rolling 7-day forecast cap is controlled by `forecast.weekly_prediction_limit` (default `25`).
+- When the cap is hit, `forecast_open` returns with `skipped_due_weekly_limit > 0`.
+
 ## Safe Local/Dry Run
 
 ```bash

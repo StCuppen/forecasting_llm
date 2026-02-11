@@ -111,6 +111,80 @@ macro = ["macro"]
             finally:
                 store.close()
 
+    def test_weekly_prediction_limit_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = tmp_path / "league.toml"
+            db_path = tmp_path / "league.sqlite3"
+            md_dir = tmp_path / "predictions" / "feedback_loop"
+            cfg.write_text(
+                f"""
+db_path = "{db_path.as_posix()}"
+window_days = 7
+[forecast]
+dry_run_default = true
+apply_calibration = false
+max_questions_per_tick = 10
+weekly_prediction_limit = 1
+prediction_log_dir = "{md_dir.as_posix()}"
+write_prediction_markdown = true
+[sources.metaculus]
+enabled = true
+[updater]
+eta = 0.4
+default_weight = 1.0
+""",
+                encoding="utf-8",
+            )
+
+            base_time = utc_now()
+            candidate_1 = QuestionCandidate(
+                source="metaculus",
+                source_id="q1",
+                title="Q1",
+                description="d1",
+                close_time=base_time + timedelta(hours=1),
+                resolve_time_expected=base_time + timedelta(hours=2),
+                tags=["macro"],
+                resolver_type="metaculus_api",
+                resolver_config={},
+                status="open",
+                raw_payload={"id": "q1"},
+            )
+            candidate_2 = QuestionCandidate(
+                source="metaculus",
+                source_id="q2",
+                title="Q2",
+                description="d2",
+                close_time=base_time + timedelta(hours=1),
+                resolve_time_expected=base_time + timedelta(hours=2),
+                tags=["macro"],
+                resolver_type="metaculus_api",
+                resolver_config={},
+                status="open",
+                raw_payload={"id": "q2"},
+            )
+
+            class _FakeMultiConnector:
+                def list_candidates(self, window_days: int = 7):
+                    return [candidate_1, candidate_2]
+
+                def fetch_details(self, source_id: str):
+                    return candidate_1 if source_id == "q1" else candidate_2
+
+                def get_resolution(self, source_id: str):
+                    return ResolutionCandidate(source="metaculus", source_id=source_id, status="unresolved")
+
+            with patch("src.jobs.ingest_7day.build_connectors", return_value={"metaculus": _FakeMultiConnector()}):
+                ingest_result = run_ingest(config_path=str(cfg))
+            self.assertEqual(ingest_result["ingested"], 2)
+
+            first = run_forecast_open(config_path=str(cfg), dry_run=True)
+            self.assertEqual(first["forecasted"], 1)
+            second = run_forecast_open(config_path=str(cfg), dry_run=True)
+            self.assertEqual(second["forecasted"], 0)
+            self.assertGreaterEqual(second["skipped_due_weekly_limit"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

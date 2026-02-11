@@ -68,6 +68,10 @@ class Storage(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def count_predictions_since(self, since: datetime) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
     def insert_resolution(self, resolution: Resolution) -> None:
         raise NotImplementedError
 
@@ -120,4 +124,3 @@ class Storage(ABC):
     @abstractmethod
     def get_calibrator(self, domain_tag: str) -> tuple[str, dict[str, Any]] | None:
         raise NotImplementedError
-

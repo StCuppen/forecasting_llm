@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 from pathlib import Path
 import uuid
 
@@ -74,9 +75,23 @@ def run_forecast_open(config_path: str = "league.toml", dry_run: bool | None = N
     try:
         if dry_run is None:
             dry_run = config.forecast.dry_run_default
-        questions = storage.list_open_unforecasted_questions(limit=config.forecast.max_questions_per_tick)
+        now = utc_now()
+        since = now - timedelta(days=7)
+        recent_prediction_count = storage.count_predictions_since(since)
+        total_open_unforecasted = len(storage.list_open_unforecasted_questions(limit=None))
+        remaining_budget = max(0, int(config.forecast.weekly_prediction_limit) - recent_prediction_count)
+        if remaining_budget <= 0:
+            return {
+                "forecasted": 0,
+                "errors": 0,
+                "skipped_due_weekly_limit": total_open_unforecasted,
+            }
+
+        per_run_limit = min(int(config.forecast.max_questions_per_tick), remaining_budget)
+        questions = storage.list_open_unforecasted_questions(limit=per_run_limit)
         forecasted = 0
         errors = 0
+        skipped_due_weekly_limit = max(0, total_open_unforecasted - len(questions))
         for question in questions:
             try:
                 domain_tag = infer_domain_tag(question.tags, config)
@@ -135,7 +150,11 @@ def run_forecast_open(config_path: str = "league.toml", dry_run: bool | None = N
                 forecasted += 1
             except Exception:
                 errors += 1
-        return {"forecasted": forecasted, "errors": errors}
+        return {
+            "forecasted": forecasted,
+            "errors": errors,
+            "skipped_due_weekly_limit": skipped_due_weekly_limit,
+        }
     finally:
         storage.close()
 

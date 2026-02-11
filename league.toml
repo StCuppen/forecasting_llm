@@ -5,6 +5,7 @@ window_days = 7
 dry_run_default = true
 apply_calibration = false
 max_questions_per_tick = 25
+weekly_prediction_limit = 25
 prediction_log_dir = "predictions/feedback_loop"
 write_prediction_markdown = true
 

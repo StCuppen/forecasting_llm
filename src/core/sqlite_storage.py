@@ -298,6 +298,13 @@ class SQLiteStorage(Storage):
             return None
         return self._from_row_prediction(row)
 
+    def count_predictions_since(self, since: datetime) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM predictions WHERE made_at >= ?",
+            (to_iso(since),),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
     def insert_resolution(self, resolution: Resolution) -> None:
         self.conn.execute(
             """
@@ -549,4 +556,3 @@ class SQLiteStorage(Storage):
         if row is None:
             return None
         return str(row["version"]), json.loads(row["payload_json"])
-

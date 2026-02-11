@@ -20,6 +20,7 @@ class ForecastConfig:
     dry_run_default: bool = False
     apply_calibration: bool = False
     max_questions_per_tick: int = 25
+    weekly_prediction_limit: int = 25
     prediction_log_dir: str = "predictions/feedback_loop"
     write_prediction_markdown: bool = True
 

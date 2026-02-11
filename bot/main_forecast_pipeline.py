@@ -391,6 +391,7 @@ class TemplateForecaster(ForecastBot):
         self,
         tournament_id: int | str,
         question_types: Literal["all", "binary"] = "all",
+        inter_question_delay_seconds: float = 2.0,
         return_exceptions: bool = False,
     ) -> list[Any]:
         """
@@ -455,7 +456,19 @@ class TemplateForecaster(ForecastBot):
             )
             if not supported_open_qs:
                 return []
-            return await self.forecast_questions(supported_open_qs, return_exceptions)
+            reports: list[Any] = []
+            delay = max(0.0, float(inter_question_delay_seconds))
+            for idx, question in enumerate(supported_open_qs, start=1):
+                logger.info(
+                    f"Processing question {idx}/{len(supported_open_qs)} | url={getattr(question, 'page_url', None)}"
+                )
+                per_question_reports = await self.forecast_questions(
+                    [question], return_exceptions=return_exceptions
+                )
+                reports.extend(per_question_reports)
+                if idx < len(supported_open_qs) and delay > 0:
+                    await asyncio.sleep(delay)
+            return reports
         else:
             logger.info("No OPEN questions found to forecast.")
             return []
@@ -525,6 +538,12 @@ def main():
         default=os.getenv("QUESTION_TYPES", "all"),
         help="Question types to process in tournament mode.",
     )
+    parser.add_argument(
+        "--inter-question-delay-seconds",
+        type=float,
+        default=float(os.getenv("INTER_QUESTION_DELAY_SECONDS", "2.0")),
+        help="Delay between tournament questions to reduce API rate-limit errors.",
+    )
 
     args = parser.parse_args()
     run_mode = args.mode
@@ -567,6 +586,7 @@ def main():
             template_bot.scan_tournament(
                 selected_tournament_id,
                 question_types=args.question_types,
+                inter_question_delay_seconds=args.inter_question_delay_seconds,
                 return_exceptions=True,
             )
         )

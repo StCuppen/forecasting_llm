@@ -35,6 +35,11 @@ on:
         required: false
         default: "1"
         type: string
+      inter_question_delay_seconds:
+        description: "Delay between questions to reduce Metaculus API rate limits"
+        required: false
+        default: "2.0"
+        type: string
   # DISABLED: GitHub cron is unreliable at midnight UTC
   # Using cron-job.org external trigger instead
   # schedule:
@@ -104,6 +109,7 @@ jobs:
           QUESTION_TYPES="${{ github.event.inputs.question_types || 'all' }}"
           MIN_QUESTIONS="${{ github.event.inputs.min_questions || '1' }}"
           MIN_POST_ATTEMPTS="${{ github.event.inputs.min_post_attempts || '1' }}"
+          INTER_QUESTION_DELAY_SECONDS="${{ github.event.inputs.inter_question_delay_seconds || '2.0' }}"
 
           poetry run python bot/main_forecast_pipeline.py \
             --mode tournament \
@@ -111,6 +117,7 @@ jobs:
             --question-types "${QUESTION_TYPES}" \
             --min-questions "${MIN_QUESTIONS}" \
             --min-post-attempts "${MIN_POST_ATTEMPTS}" \
+            --inter-question-delay-seconds "${INTER_QUESTION_DELAY_SECONDS}" \
             ${EXTRA_FLAGS} 2>&1 | tee bot.log
 
       - name: Summarize results

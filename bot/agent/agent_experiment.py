@@ -4,7 +4,9 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from statistics import median
+from typing import Any, Optional
+from urllib.parse import urlparse
 import dotenv
 
 dotenv.load_dotenv()
@@ -20,8 +22,16 @@ from .utils import (
     record_token_usage,
     extract_search_queries,
     extract_market_probabilities,
+    extract_json_from_response,
 )
-from .prompts import FORECASTER_CONTEXT, REACT_SYSTEM_PROMPT
+from .prompts import (
+    FORECASTER_CONTEXT,
+    REACT_SYSTEM_PROMPT,
+    JUDGE_SYNTHESIS_PROMPT,
+    SPEC_EXTRACTION_PROMPT,
+    SPEC_CONSISTENCY_PROMPT,
+    OUTLIER_CROSSEXAM_PROMPT,
+)
 
 from forecasting_tools import MetaculusApi
 
@@ -54,12 +64,21 @@ class AgentForecastOutput:
     search_count: int = 0
     sources: list = None  # List of SourceInfo dicts
     token_usage: dict = None
+    warnings: list = None
+    risk_flags: list = None
+    diagnostics: dict = None
     
     def __post_init__(self):
         if self.sources is None:
             self.sources = []
         if self.token_usage is None:
             self.token_usage = {}
+        if self.warnings is None:
+            self.warnings = []
+        if self.risk_flags is None:
+            self.risk_flags = []
+        if self.diagnostics is None:
+            self.diagnostics = {}
 
 
 @dataclass
@@ -70,6 +89,184 @@ class SourceInfo:
     date: str = ""
     quality: str = "Medium"  # High, Medium, Low
     snippet: str = ""
+
+
+@dataclass
+class CanonicalSpec:
+    target: str
+    yes_condition: str
+    no_condition: str
+    time_window: str
+    threshold: str = ""
+    metric: str = ""
+    canonical_one_line: str = ""
+
+
+@dataclass
+class FeatureFlags:
+    spec_lock: bool = True
+    evidence_ledger: bool = True
+    numeric_provenance: bool = True
+    market_snapshot: bool = True
+    outlier_xexam: bool = True
+
+
+def _flags_from_dict(raw: Optional[dict[str, Any]]) -> FeatureFlags:
+    defaults = FeatureFlags()
+    if not raw:
+        return defaults
+    return FeatureFlags(
+        spec_lock=bool(raw.get("spec_lock", defaults.spec_lock)),
+        evidence_ledger=bool(raw.get("evidence_ledger", defaults.evidence_ledger)),
+        numeric_provenance=bool(raw.get("numeric_provenance", defaults.numeric_provenance)),
+        market_snapshot=bool(raw.get("market_snapshot", defaults.market_snapshot)),
+        outlier_xexam=bool(raw.get("outlier_xexam", defaults.outlier_xexam)),
+    )
+
+
+def _format_canonical_spec_text(spec: Optional[CanonicalSpec], question: str) -> str:
+    if spec is None:
+        return f"- One-line: {question}"
+    one_line = spec.canonical_one_line or question
+    return (
+        f"- One-line: {one_line}\n"
+        f"- YES: {spec.yes_condition or 'See question text'}\n"
+        f"- NO: {spec.no_condition or 'Complement of YES'}\n"
+        f"- Window: {spec.time_window or 'Not specified'}\n"
+        f"- Threshold: {spec.threshold or 'None'}\n"
+        f"- Metric: {spec.metric or 'None'}"
+    )
+
+
+def _directness_tag_for_url(url: str) -> str:
+    host = (urlparse(url).netloc or "").lower()
+    if not host:
+        return "CONTEXT"
+
+    if any(x in host for x in [".gov", ".edu", ".int", "europa.eu", "census.gov", "bls.gov", "federalreserve.gov", "olympics.com"]):
+        return "DIRECT"
+    if any(x in host for x in ["wikipedia.org", "reuters.com", "apnews.com", "ft.com", "wsj.com", "bloomberg.com", "bbc.com"]):
+        return "PROXY"
+    return "CONTEXT"
+
+
+def _extract_numeric_claims(text: str) -> list[str]:
+    claims = []
+    for m in re.finditer(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*%?\b', text):
+        token = m.group(0).strip()
+        if len(token) <= 1:
+            continue
+        claims.append(token)
+    # Keep first 40 claims max to avoid huge validator payloads.
+    return claims[:40]
+
+
+def _numeric_provenance_report(model_text: str, evidence_text: str) -> dict[str, Any]:
+    claims = _extract_numeric_claims(model_text)
+    evidence_lower = evidence_text.lower()
+    report_items: list[dict[str, str]] = []
+    orphan_count = 0
+    assumption_count = 0
+    sourced_count = 0
+
+    for claim in claims:
+        c = claim.lower()
+        if c and c in evidence_lower:
+            status = "sourced"
+            sourced_count += 1
+        else:
+            # Approximate assumption detection from local context sentence.
+            ctx_match = re.search(rf'[^.\n]*{re.escape(claim)}[^.\n]*', model_text, re.IGNORECASE)
+            ctx = ctx_match.group(0).lower() if ctx_match else ""
+            if any(k in ctx for k in ["assume", "assumption", "pathway", "chance", "estimate", "roughly", "about"]):
+                status = "assumption"
+                assumption_count += 1
+            else:
+                status = "orphan"
+                orphan_count += 1
+        report_items.append({"claim": claim, "status": status})
+
+    return {
+        "total_claims": len(claims),
+        "sourced": sourced_count,
+        "assumption": assumption_count,
+        "orphan": orphan_count,
+        "items": report_items,
+    }
+
+
+def _mentions_market_odds(text: str) -> bool:
+    return bool(
+        re.search(
+            r'(metaculus|manifold|polymarket|kalshi|predictit)[^\n]{0,100}\d{1,3}(?:\.\d+)?\s*%',
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+async def extract_canonical_spec(
+    question: str,
+    model: str = "google/gemini-2.5-flash",
+) -> CanonicalSpec:
+    prompt = SPEC_EXTRACTION_PROMPT.format(question=question)
+    try:
+        raw = await call_openrouter_llm(
+            prompt=prompt,
+            model=model,
+            temperature=0.0,
+            max_tokens=1200,
+            usage_label="spec_extract",
+        )
+        obj = extract_json_from_response(raw)
+    except Exception as exc:
+        logger.warning(f"Canonical spec extraction failed, using fallback: {exc}")
+        obj = {
+            "target": question,
+            "yes_condition": "As stated in question",
+            "no_condition": "Complement of YES in question",
+            "time_window": "As stated in question",
+            "threshold": "",
+            "metric": "",
+            "canonical_one_line": question,
+        }
+    return CanonicalSpec(
+        target=str(obj.get("target", question)),
+        yes_condition=str(obj.get("yes_condition", "As stated in question")),
+        no_condition=str(obj.get("no_condition", "Complement of YES in question")),
+        time_window=str(obj.get("time_window", "As stated in question")),
+        threshold=str(obj.get("threshold", "")),
+        metric=str(obj.get("metric", "")),
+        canonical_one_line=str(obj.get("canonical_one_line", question)),
+    )
+
+
+async def check_spec_consistency(
+    canonical_spec_text: str,
+    model_answer: str,
+    model: str = "google/gemini-2.5-flash",
+) -> tuple[str, str]:
+    prompt = SPEC_CONSISTENCY_PROMPT.format(
+        canonical_spec_text=canonical_spec_text,
+        model_answer=model_answer[-6000:],
+    )
+    try:
+        raw = await call_openrouter_llm(
+            prompt=prompt,
+            model=model,
+            temperature=0.0,
+            max_tokens=500,
+            usage_label="spec_check",
+        )
+        obj = extract_json_from_response(raw)
+        status = str(obj.get("status", "MINOR_DRIFT")).upper()
+        if status not in {"OK", "MINOR_DRIFT", "MAJOR_DRIFT"}:
+            status = "MINOR_DRIFT"
+        reason = str(obj.get("reason", "No reason provided"))
+        return status, reason
+    except Exception as exc:
+        logger.warning(f"Spec consistency check failed, defaulting to MINOR_DRIFT: {exc}")
+        return "MINOR_DRIFT", f"Spec check unavailable: {exc}"
 
 
 class ForecastingAgent:
@@ -745,7 +942,10 @@ class ForecastingAgent:
         question: str,
         community_prior: float = None,
         max_searches: int = 30,
+        max_searches_per_iteration: int = 3,
         max_tokens_total: int = 75000,
+        canonical_spec: Optional[CanonicalSpec] = None,
+        feature_flags: Optional[FeatureFlags] = None,
     ) -> AgentForecastOutput:
         """
         ReAct-style iterative agent: search, reason, forecast in unified loop.
@@ -757,7 +957,10 @@ class ForecastingAgent:
             question: Forecasting question text
             community_prior: Optional community/market prior (0-1)
             max_searches: Maximum number of search actions (default 30)
+            max_searches_per_iteration: Maximum SEARCH() calls executed from a single model response
             max_tokens_total: Token budget per model (default 75k)
+            canonical_spec: Canonical resolution lens used for drift checking
+            feature_flags: Soft guardrail feature toggles
         
         Returns:
             AgentForecastOutput with probability and full explanation
@@ -766,6 +969,8 @@ class ForecastingAgent:
         import json
         
         today_str = datetime.utcnow().date().isoformat()
+        flags = feature_flags or FeatureFlags()
+        canonical_spec_text = _format_canonical_spec_text(canonical_spec, question)
         
         # Set up logging directory
         logs_dir = "forecasts/react_logs"
@@ -784,6 +989,7 @@ class ForecastingAgent:
             question=question,
             today=today_str,
             prior_text=prior_text,
+            canonical_spec_text=canonical_spec_text,
         )
         
         messages = [{"role": "user", "content": system_prompt}]
@@ -794,6 +1000,13 @@ class ForecastingAgent:
         completion_tokens_used = 0
         all_searches = []
         all_sources = []  # Track all sources with full metadata
+        evidence_ledger = []
+        ledger_next_id = 1
+        market_snapshot = {"found": False, "items": []}
+        warning_messages = []
+        risk_flags = []
+        spec_status = "NOT_CHECKED"
+        spec_reason = ""
         iteration = 0
         max_iterations = 5  # Capped at 5 iterations for efficiency
         
@@ -804,6 +1017,9 @@ class ForecastingAgent:
 **Question**: {question}
 **Timestamp**: {timestamp}
 **Community Prior**: {community_prior if community_prior else 'None'}
+**Canonical Spec**:
+{canonical_spec_text}
+**Feature Flags**: {flags}
 
 ---
 
@@ -816,6 +1032,44 @@ class ForecastingAgent:
 ## Agent Conversation
 
 """
+
+        def _run_soft_validators(final_text: str) -> tuple[list[str], list[str], dict[str, Any]]:
+            warnings_local: list[str] = []
+            risk_local: list[str] = []
+            diagnostics: dict[str, Any] = {
+                "spec_status": spec_status,
+                "spec_reason": spec_reason,
+                "canonical_spec": canonical_spec_text,
+                "evidence_ledger": evidence_ledger if flags.evidence_ledger else [],
+                "market_snapshot": market_snapshot if flags.market_snapshot else {"found": False, "items": []},
+            }
+
+            if flags.numeric_provenance:
+                evidence_text = "\n".join([s.get("results", "") for s in all_searches])[:30000]
+                numeric_report = _numeric_provenance_report(final_text, evidence_text)
+                diagnostics["numeric_provenance"] = numeric_report
+                orphan = numeric_report.get("orphan", 0)
+                if orphan > 0:
+                    warnings_local.append(f"Numeric provenance warning: {orphan} orphan numeric claim(s).")
+                if orphan >= 4:
+                    risk_local.append("ORPHAN_NUMERICS_HIGH")
+
+            if flags.market_snapshot:
+                found = bool(market_snapshot.get("found"))
+                if not found and _mentions_market_odds(final_text):
+                    warnings_local.append("Market odds mentioned without direct market snapshot (found=false).")
+                    risk_local.append("MARKET_HALLUCINATION")
+
+            if flags.evidence_ledger and evidence_ledger:
+                direct_count = sum(1 for e in evidence_ledger if e.get("directness_tag") == "DIRECT")
+                proxy_count = sum(1 for e in evidence_ledger if e.get("directness_tag") == "PROXY")
+                diagnostics["direct_source_count"] = direct_count
+                diagnostics["proxy_source_count"] = proxy_count
+                if direct_count == 0 and proxy_count > 0:
+                    warnings_local.append("Evidence quality warning: no direct sources, proxy-heavy evidence.")
+                    risk_local.append("PROXY_HEAVY")
+
+            return warnings_local, risk_local, diagnostics
         
         while iteration < max_iterations:
             iteration += 1
@@ -838,7 +1092,7 @@ class ForecastingAgent:
             try:
                 response, usage = await self._llm_conversation(
                     messages,
-                    max_tokens=8000,
+                    max_tokens=16000,
                     temperature=0.5,
                     usage_label=f"react:iter{iteration}"
                 )
@@ -856,7 +1110,9 @@ class ForecastingAgent:
             
             if not response:
                 logger.warning("Empty response from model")
-                messages.append({"role": "user", "content": "Please continue with your analysis."})
+                # Don't burn this iteration — decrement so we retry
+                iteration -= 1
+                messages.append({"role": "user", "content": "Your previous response was empty. Please continue with your analysis or provide your FINAL_FORECAST."})
                 continue
             
             # Log the assistant response
@@ -866,9 +1122,79 @@ class ForecastingAgent:
             messages.append({"role": "assistant", "content": response})
             
             # Check for FINAL_FORECAST
+            min_searches = 3
+            if "FINAL_FORECAST" in response and search_count < min_searches and iteration < max_iterations - 1:
+                # Model tried to conclude too early — reject and nudge for more research
+                needed = min_searches - search_count
+                logger.info(f"Rejecting early FINAL_FORECAST: only {search_count}/{min_searches} searches done")
+                messages.append({
+                    "role": "user",
+                    "content": f"You have only done {search_count} search(es) — that is not enough for a calibrated forecast. "
+                    f"Issue at least {needed} more SEARCH calls for current news, recent developments, and prediction market data before providing your FINAL_FORECAST."
+                })
+                continue
+
             if "FINAL_FORECAST" in response:
                 logger.info(f"Final forecast received after {iteration} iterations, {search_count} searches")
+                if flags.spec_lock:
+                    spec_status, spec_reason = await check_spec_consistency(
+                        canonical_spec_text=canonical_spec_text,
+                        model_answer=response,
+                    )
+                    if spec_status == "MINOR_DRIFT":
+                        warning_messages.append(f"Spec consistency MINOR_DRIFT: {spec_reason}")
+                    elif spec_status == "MAJOR_DRIFT":
+                        warning_messages.append(f"Spec consistency MAJOR_DRIFT: {spec_reason}")
+                        risk_flags.append("SPEC_MAJORDRIFT")
+                        # Single repair pass, then continue even if still drifting.
+                        repair_prompt = (
+                            "Repair pass required.\n"
+                            "Your previous answer drifted from the canonical spec.\n"
+                            f"Canonical spec:\n{canonical_spec_text}\n\n"
+                            "Provide FINAL_FORECAST again, strictly matching this spec.\n"
+                            "Do not add new SEARCH calls.\n"
+                            "Use exact final format with Probability and One-line summary."
+                        )
+                        messages.append({"role": "user", "content": repair_prompt})
+                        try:
+                            repair_response, repair_usage = await self._llm_conversation(
+                                messages,
+                                max_tokens=2000,
+                                temperature=0.2,
+                                usage_label="react:spec_repair",
+                            )
+                            total_tokens_used += repair_usage.get("total_tokens", 0)
+                            prompt_tokens_used += repair_usage.get("prompt_tokens", 0)
+                            completion_tokens_used += repair_usage.get("completion_tokens", 0)
+                            log_content += f"\n### User (Spec Repair)\n\n{repair_prompt}\n"
+                            log_content += (
+                                f"\n### Assistant (Spec Repair, {repair_usage.get('total_tokens', 0)} tokens)\n\n"
+                                f"{repair_response}\n"
+                            )
+                            if repair_response and "FINAL_FORECAST" in repair_response:
+                                messages.append({"role": "assistant", "content": repair_response})
+                                repair_status, repair_reason = await check_spec_consistency(
+                                    canonical_spec_text=canonical_spec_text,
+                                    model_answer=repair_response,
+                                )
+                                spec_status = repair_status
+                                spec_reason = repair_reason
+                                if repair_status != "MAJOR_DRIFT":
+                                    response = repair_response
+                                else:
+                                    warning_messages.append(f"Spec repair failed: {repair_reason}")
+                                    risk_flags.append("SPEC_REPAIR_FAILED")
+                            else:
+                                warning_messages.append("Spec repair pass did not return FINAL_FORECAST.")
+                                risk_flags.append("SPEC_REPAIR_EMPTY")
+                        except Exception as spec_exc:
+                            warning_messages.append(f"Spec repair call failed: {spec_exc}")
+                            risk_flags.append("SPEC_REPAIR_ERROR")
+
                 probability = extract_probability_from_forecast(response)
+                validator_warnings, validator_risks, diagnostics = _run_soft_validators(response)
+                warning_messages.extend(validator_warnings)
+                risk_flags.extend(validator_risks)
                 
                 # Build full explanation from conversation
                 full_explanation = self._build_explanation_from_conversation(messages, all_searches)
@@ -883,12 +1209,21 @@ class ForecastingAgent:
 - **Searches**: {search_count}
 - **Total Tokens**: {total_tokens_used}
 - **Final Probability**: {probability:.1%}
+- **Spec Consistency**: {spec_status}
 
 ## Search Queries Used
 
 """
                 for i, s in enumerate(all_searches, 1):
                     log_content += f"{i}. {s['query']}\n"
+                if warning_messages:
+                    log_content += "\n## Warnings\n\n"
+                    for w in warning_messages:
+                        log_content += f"- {w}\n"
+                if risk_flags:
+                    log_content += "\n## Risk Flags\n\n"
+                    for rf in sorted(set(risk_flags)):
+                        log_content += f"- {rf}\n"
                 
                 # Save log file
                 with open(log_file, "w", encoding="utf-8") as f:
@@ -904,78 +1239,139 @@ class ForecastingAgent:
                         "prompt": prompt_tokens_used,
                         "completion": completion_tokens_used,
                         "total": total_tokens_used,
-                    }
+                    },
+                    warnings=warning_messages,
+                    risk_flags=sorted(set(risk_flags)),
+                    diagnostics=diagnostics,
                 )
             
-            # Check for SEARCH action
-            search_match = re.search(r'SEARCH\s*\(\s*["\']([^"\']+)["\']\s*\)', response)
-            if search_match and search_count < max_searches:
-                query = search_match.group(1)
-                search_count += 1
-                logger.info(f"Search {search_count}/{max_searches}: {query}")
-                log_content += f"\n### Search {search_count}: `{query}`\n"
-                
-                try:
-                    if self.exa_client:
-                        results = await self.exa_client.search(query, num_results=8)
-                        # Track sources with full metadata
-                        for r in results:
-                            all_sources.append({
-                                "url": r.get("url", ""),
-                                "title": r.get("title", "Untitled")[:80],
-                                "date": r.get("published_date", "")[:10] if r.get("published_date") else "",
-                                "quality": "Medium",  # Default, could be enhanced
-                                "snippet": r.get("content", "")[:200] if r.get("content") else "",
-                            })
-                        formatted_results = self._format_search_results(results, query)
-                        all_searches.append({"query": query, "results": formatted_results, "source_count": len(results)})
-                        log_content += f"\n{formatted_results[:2000]}...\n" if len(formatted_results) > 2000 else f"\n{formatted_results}\n"
-                        messages.append({
-                            "role": "user",
-                            "content": f"Search results for '{query}':\n\n{formatted_results}\n\nContinue your analysis. You may search again or provide your FINAL_FORECAST when ready."
-                        })
-                    else:
-                        log_content += "\n**[Search failed - no client available]**\n"
-                        messages.append({
-                            "role": "user",
-                            "content": f"Search failed (no search client available). Continue with available information or try a different approach."
-                        })
-                except Exception as e:
-                    logger.warning(f"Search failed: {e}")
-                    log_content += f"\n**[Search failed: {str(e)[:100]}]**\n"
-                    messages.append({
-                        "role": "user",
-                        "content": f"Search for '{query}' failed: {str(e)[:100]}. Continue with available information or try a different query."
-                    })
+            # Determine if model should be forced to conclude (no more searching)
+            should_force = (
+                iteration >= max_iterations - 1
+                or search_count >= max_searches
+                or (search_count >= min_searches and iteration >= 3)  # enough data after min searches
+            )
+
+            # Check for SEARCH actions — extract ALL queries from the response
+            search_matches = re.findall(r'SEARCH\s*\(\s*["\']([^"\']+)["\']\s*\)', response)
+            if search_matches and should_force:
+                logger.info(
+                    f"Ignoring SEARCH actions because model should finalize now "
+                    f"(iteration={iteration}, searches={search_count})."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Do not search again. You already have enough information. "
+                        "Provide FINAL_FORECAST now in the required format."
+                    )
+                })
+                continue
+
+            if search_matches and search_count < max_searches:
+                # Process up to remaining budget and per-iteration cap to prevent query spam
+                remaining_budget = max_searches - search_count
+                allowed_this_turn = min(max_searches_per_iteration, remaining_budget)
+                queries_to_run = search_matches[:allowed_this_turn]
+                if len(search_matches) > allowed_this_turn:
+                    logger.info(
+                        f"Capping SEARCH calls this iteration: requested={len(search_matches)}, "
+                        f"running={allowed_this_turn}, max_per_iteration={max_searches_per_iteration}"
+                    )
+                    log_content += (
+                        f"\n**[SYSTEM] SEARCH cap applied: model requested {len(search_matches)} "
+                        f"queries, executed {allowed_this_turn} this iteration.**\n"
+                    )
+                all_formatted = []
+
+                for query in queries_to_run:
+                    if search_count >= max_searches:
+                        break
+                    search_count += 1
+                    logger.info(f"Search {search_count}/{max_searches}: {query}")
+                    log_content += f"\n### Search {search_count}: `{query}`\n"
+
+                    try:
+                        if self.exa_client:
+                            results = await self.exa_client.search(query, num_results=8)
+                            # Track sources with dedup by URL
+                            seen_urls = {s["url"] for s in all_sources}
+                            for r in results:
+                                url = r.get("url", "")
+                                if url and url not in seen_urls:
+                                    seen_urls.add(url)
+                                    all_sources.append({
+                                        "url": url,
+                                        "title": r.get("title", "Untitled")[:80],
+                                        "date": r.get("published_date", "")[:10] if r.get("published_date") else "",
+                                        "quality": "Medium",
+                                        "snippet": r.get("content", "")[:200] if r.get("content") else "",
+                                    })
+                                    if flags.evidence_ledger:
+                                        evidence_ledger.append({
+                                            "id": f"LEDGER-{ledger_next_id}",
+                                            "source_type": "web_search",
+                                            "url_ref": url,
+                                            "retrieved_at": datetime.utcnow().isoformat(),
+                                            "snippet": (r.get("content", "") or "")[:220],
+                                            "directness_tag": _directness_tag_for_url(url),
+                                        })
+                                        ledger_next_id += 1
+                            formatted_results = self._format_search_results(results, query)
+                            all_searches.append({"query": query, "results": formatted_results, "source_count": len(results)})
+                            if flags.market_snapshot:
+                                extracted = extract_market_probabilities(formatted_results)
+                                if extracted:
+                                    market_snapshot["found"] = True
+                                    for item in extracted:
+                                        if item not in market_snapshot["items"]:
+                                            market_snapshot["items"].append(item)
+                            all_formatted.append(f"### Results for '{query}':\n{formatted_results}")
+                            log_content += f"\n{formatted_results[:2000]}...\n" if len(formatted_results) > 2000 else f"\n{formatted_results}\n"
+                        else:
+                            all_formatted.append(f"### Results for '{query}': Search failed (no client available)")
+                            log_content += "\n**[Search failed - no client available]**\n"
+                    except Exception as e:
+                        logger.warning(f"Search failed: {e}")
+                        all_formatted.append(f"### Results for '{query}': Search failed: {str(e)[:100]}")
+                        log_content += f"\n**[Search failed: {str(e)[:100]}]**\n"
+
+                combined_results = "\n\n".join(all_formatted)
+                remaining = max_searches - search_count
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"{combined_results}\n\nYou have {remaining} searches remaining. "
+                        f"At most {max_searches_per_iteration} SEARCH calls are executed per response. "
+                        "Continue analysis or provide your FINAL_FORECAST when ready."
+                    )
+                })
                 continue
             
-            # No action found - prompt model to continue
-            # Force completion more aggressively as iterations increase
-            if iteration >= max_iterations - 1:
-                # LAST ITERATION - force completion NOW
+            # No action found - prompt model to continue or conclude
+            # If searches are below minimum, nudge for more research before allowing conclusion
+            if search_count < min_searches and iteration < max_iterations - 1:
+                needed = min_searches - search_count
                 messages.append({
                     "role": "user",
-                    "content": """STOP. You have run out of iterations. You MUST output your FINAL_FORECAST NOW.
+                    "content": f"You have only done {search_count} search(es). Issue at least {needed} more SEARCH calls "
+                    f"to gather current news, recent developments, and prediction market odds before concluding."
+                })
+                continue
 
-Based on all information gathered, output EXACTLY this format:
+            # Force conclusion aggressively once we have enough searches or iterations
+            if should_force:
+                messages.append({
+                    "role": "user",
+                    "content": """You have enough information. Provide your FINAL_FORECAST NOW.
 
-### 5. PROBABILITY COMPUTATION
-| Pathway | Probability |
-|---------|-------------|
-| [Path1] | X% |
-| [Path2] | Y% |
-| **TOTAL P(YES)** | **Z%** |
+Use this EXACT format:
 
 FINAL_FORECAST
-Probability: [Z - same as TOTAL above]
-One-line summary: [Your reasoning]
+Probability: [your probability as a percentage, e.g. 25%]
+One-line summary: [single sentence explaining your reasoning]
 
-OUTPUT NOW. Do not search again. Do not explain. Just give the table and FINAL_FORECAST."""
-                })
-            elif search_count >= max_searches:
-                messages.append({
-                    "role": "user",
-                    "content": "You've reached the search limit. Please provide your FINAL_FORECAST now with the pathway probability table."
+Do not search again. Output FINAL_FORECAST now."""
                 })
             else:
                 messages.append({
@@ -983,10 +1379,129 @@ OUTPUT NOW. Do not search again. Do not explain. Just give the table and FINAL_F
                     "content": "Continue your analysis. Use SEARCH(\"query\") to find more information, or provide your FINAL_FORECAST when ready."
                 })
         
-        # Fallback: extract best probability from conversation
-        logger.warning(f"Agent did not produce final forecast after {iteration} iterations")
+        # Fallback: make one last dedicated call to force a probability out
+        logger.warning(f"Agent did not produce final forecast after {iteration} iterations, attempting forced extraction")
+
+        # Last-ditch: ask the model directly for just a number
+        try:
+            assistant_text = "\n".join([m["content"] for m in messages if m["role"] == "assistant"])
+            # Trim to last 3000 chars to stay within context
+            summary_text = assistant_text[-3000:] if len(assistant_text) > 3000 else assistant_text
+            force_messages = [
+                {"role": "user", "content": f"A forecaster was analyzing this question: {question}\n\nHere is their research and analysis so far:\n{summary_text}\n\nBased on this analysis, what is the probability that the answer is YES? Reply with ONLY a number between 0 and 100 (representing the percentage). Just the number, nothing else."}
+            ]
+            force_response, _ = await self._llm_conversation(
+                force_messages,
+                max_tokens=100,
+                temperature=0.2,
+                usage_label="react:forced_extraction"
+            )
+            # Try to extract a number from the response
+            num_match = re.search(r'(\d{1,3}(?:\.\d+)?)', force_response.strip())
+            if num_match:
+                forced_prob = float(num_match.group(1))
+                if forced_prob > 1:
+                    forced_prob = forced_prob / 100
+                if 0.01 <= forced_prob <= 0.99:
+                    logger.info(f"Forced extraction got probability: {forced_prob:.1%}")
+                    full_text = "\n".join([m["content"] for m in messages if m["role"] == "assistant"])
+                    if flags.spec_lock:
+                        spec_status, spec_reason = await check_spec_consistency(
+                            canonical_spec_text=canonical_spec_text,
+                            model_answer=full_text,
+                        )
+                        if spec_status != "OK":
+                            warning_messages.append(f"Spec consistency {spec_status}: {spec_reason}")
+                            if spec_status == "MAJOR_DRIFT":
+                                risk_flags.append("SPEC_MAJORDRIFT")
+                    validator_warnings, validator_risks, diagnostics = _run_soft_validators(full_text)
+                    warning_messages.extend(validator_warnings)
+                    risk_flags.extend(validator_risks)
+
+                    log_content += f"\n\n**[SYSTEM] Forced probability extraction: {forced_prob:.1%}**\n"
+
+                    # Save log
+                    log_content += f"""
+---
+
+## Summary (FORCED EXTRACTION)
+
+- **Iterations**: {iteration}
+- **Searches**: {search_count}
+- **Total Tokens**: {total_tokens_used}
+- **Extracted Probability**: {forced_prob:.1%}
+
+## Search Queries Used
+
+"""
+                    for i, s in enumerate(all_searches, 1):
+                        log_content += f"{i}. {s['query']}\n"
+                    if warning_messages:
+                        log_content += "\n## Warnings\n\n"
+                        for w in warning_messages:
+                            log_content += f"- {w}\n"
+                    if risk_flags:
+                        log_content += "\n## Risk Flags\n\n"
+                        for rf in sorted(set(risk_flags)):
+                            log_content += f"- {rf}\n"
+
+                    with open(log_file, "w", encoding="utf-8") as f:
+                        f.write(log_content)
+
+                    return AgentForecastOutput(
+                        probability=forced_prob,
+                        explanation=f"[Forced extraction after iteration limit]\n\n{full_text[-5000:]}",
+                        search_count=search_count,
+                        sources=all_sources,
+                        token_usage={
+                            "prompt": prompt_tokens_used,
+                            "completion": completion_tokens_used,
+                            "total": total_tokens_used,
+                        },
+                        warnings=warning_messages,
+                        risk_flags=sorted(set(risk_flags)),
+                        diagnostics=diagnostics,
+                    )
+        except Exception as e:
+            logger.warning(f"Forced extraction failed: {e}")
+
         full_text = "\n".join([m["content"] for m in messages if m["role"] == "assistant"])
         probability = extract_probability_from_forecast(full_text)
+        if flags.spec_lock:
+            spec_status, spec_reason = await check_spec_consistency(
+                canonical_spec_text=canonical_spec_text,
+                model_answer=full_text,
+            )
+            if spec_status != "OK":
+                warning_messages.append(f"Spec consistency {spec_status}: {spec_reason}")
+                if spec_status == "MAJOR_DRIFT":
+                    risk_flags.append("SPEC_MAJORDRIFT")
+        validator_warnings, validator_risks, diagnostics = _run_soft_validators(full_text)
+        warning_messages.extend(validator_warnings)
+        risk_flags.extend(validator_risks)
+
+        # If still at default 0.5, try extracting any percentage from assistant messages
+        if probability == 0.5:
+            # Look for any explicit probability statements in reverse order (latest first)
+            for msg in reversed(messages):
+                if msg["role"] != "assistant":
+                    continue
+                # Look for patterns like "I estimate 35%", "probability of 70%", "around 20%", "likely ~60%"
+                prob_patterns = [
+                    r'(?:estimat|predict|assess|believ|think|probability|likelihood|chance|forecast)[^\n]{0,40}?(\d{1,2}(?:\.\d+)?)\s*%',
+                    r'(\d{1,2}(?:\.\d+)?)\s*%\s*(?:probability|likely|chance|likelihood)',
+                    r'(?:around|approximately|roughly|about|~)\s*(\d{1,2}(?:\.\d+)?)\s*%',
+                ]
+                for pat in prob_patterns:
+                    m = re.search(pat, msg["content"], re.IGNORECASE)
+                    if m:
+                        candidate = float(m.group(1)) / 100
+                        if 0.01 <= candidate <= 0.99:
+                            probability = candidate
+                            logger.info(f"Extracted fallback probability {probability:.1%} from conversation")
+                            break
+                if probability != 0.5:
+                    break
         
         # Save log even on fallback
         log_content += f"""
@@ -1004,6 +1519,14 @@ OUTPUT NOW. Do not search again. Do not explain. Just give the table and FINAL_F
 """
         for i, s in enumerate(all_searches, 1):
             log_content += f"{i}. {s['query']}\n"
+        if warning_messages:
+            log_content += "\n## Warnings\n\n"
+            for w in warning_messages:
+                log_content += f"- {w}\n"
+        if risk_flags:
+            log_content += "\n## Risk Flags\n\n"
+            for rf in sorted(set(risk_flags)):
+                log_content += f"- {rf}\n"
         
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(log_content)
@@ -1018,7 +1541,10 @@ OUTPUT NOW. Do not search again. Do not explain. Just give the table and FINAL_F
                 "prompt": prompt_tokens_used,
                 "completion": completion_tokens_used,
                 "total": total_tokens_used,
-            }
+            },
+            warnings=warning_messages,
+            risk_flags=sorted(set(risk_flags)),
+            diagnostics=diagnostics,
         )
     
     def _format_search_results(self, results: list, query: str) -> str:
@@ -1161,6 +1687,8 @@ async def run_ensemble_forecast(
     publish_to_metaculus: bool = False,
     community_prior: float = None,
     use_react: bool = True,
+    feature_flags: Optional[dict[str, Any]] = None,
+    outlier_threshold_pp: float = 15.0,
 ) -> dict:
     """
     Run an ensemble of forecasting agents on a question.
@@ -1171,6 +1699,8 @@ async def run_ensemble_forecast(
         publish_to_metaculus: Whether to post the result to Metaculus.
         community_prior: Metaculus community prediction (0-1) to use as anchor.
         use_react: If True, use new ReAct-style iterative agent. If False, use legacy agent.
+        feature_flags: Optional module toggles (spec_lock, evidence_ledger, numeric_provenance, market_snapshot, outlier_xexam).
+        outlier_threshold_pp: Outlier threshold in percentage points for cross-exam.
         
     Returns:
         dict containing:
@@ -1179,20 +1709,48 @@ async def run_ensemble_forecast(
         - full_log: str
         - individual_results: list[dict]
     """
+    flags = _flags_from_dict(feature_flags)
+    original_question_input = question.strip()
+    question_url_for_post: Optional[str] = None
+    if original_question_input.lower().startswith("http") and "metaculus.com/questions/" in original_question_input:
+        question_url_for_post = original_question_input
+        try:
+            meta_q = MetaculusApi.get_question_by_url(question_url_for_post)
+            if meta_q is not None:
+                rich_parts = [
+                    getattr(meta_q, "question_text", "") or "",
+                    getattr(meta_q, "resolution_criteria", "") or "",
+                    getattr(meta_q, "fine_print", "") or "",
+                    getattr(meta_q, "background_info", "") or "",
+                ]
+                question = "\n\n".join([p.strip() for p in rich_parts if p and p.strip()])[:12000]
+                cp = getattr(meta_q, "community_prediction_at_access_time", None)
+                if community_prior is None and isinstance(cp, (float, int)) and 0 <= cp <= 1:
+                    community_prior = float(cp)
+                logger.info("Loaded rich Metaculus question content from URL input.")
+        except Exception as meta_exc:
+            logger.warning(f"Could not enrich question from Metaculus URL: {meta_exc}")
+
     if models is None:
-        # Two-model ensemble with reasoning enabled
+        # Default production trio requested by user.
         models = [
             {
-                "name": "xiaomi/mimo-v2-flash:free",
-                "reasoning_effort": "medium",  # Enable reasoning for better forecasts
+                "name": "moonshotai/kimi-k2.5",
+                "reasoning_effort": None,  # Kimi has built-in reasoning
                 "max_tokens": 100000,
-                "label": "MiMo v2 Flash"
+                "label": "Kimi K2.5"
             },
             {
-                "name": "google/gemini-3-flash-preview",
-                "reasoning_effort": "medium",  # Enable reasoning for better forecasts
+                "name": "google/gemini-2.5-flash",
+                "reasoning_effort": "medium",
                 "max_tokens": 100000,
-                "label": "Gemini 3 Flash (Reasoning)"
+                "label": "Gemini 2.5 Flash"
+            },
+            {
+                "name": "openai/gpt-5-mini",
+                "reasoning_effort": "medium",
+                "max_tokens": 32000,
+                "label": "GPT-5 Mini"
             },
         ]
 
@@ -1200,43 +1758,65 @@ async def run_ensemble_forecast(
     print(f"Starting Multi-Model Ensemble Forecast ({agent_type}) for: {question}")
     print("-" * 60)
 
-    results = []
     logs_dir = "forecasts"
     os.makedirs(logs_dir, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    
-    full_log_content = f"# FORECAST LOG - {timestamp}\nAgent Type: {agent_type}\n\nQuestion: {question}\n\n"
 
-    for config in models:
-        print(f"\n>>> Running {config['label']} ({config['name']}) with {agent_type} agent...")
-        try:
-            agent = ForecastingAgent(
-                model_name=config["name"],
-                reasoning_effort=config.get("reasoning_effort")
+    canonical_spec = await extract_canonical_spec(question) if flags.spec_lock else None
+    canonical_spec_text = _format_canonical_spec_text(canonical_spec, question)
+
+    full_log_content = (
+        f"# FORECAST LOG - {timestamp}\n"
+        f"Agent Type: {agent_type}\n\n"
+        f"Question: {question}\n\n"
+        f"Feature Flags: {flags}\n\n"
+        f"Canonical Spec:\n{canonical_spec_text}\n\n"
+    )
+
+    # --- Run all models in parallel ---
+    async def _run_one(config: dict) -> dict:
+        """Run a single model and return config + result or error."""
+        agent = ForecastingAgent(
+            model_name=config["name"],
+            reasoning_effort=config.get("reasoning_effort")
+        )
+        if use_react:
+            result = await agent.run_react_agent(
+                question,
+                community_prior=community_prior,
+                canonical_spec=canonical_spec,
+                feature_flags=flags,
             )
-            
-            # Use ReAct agent (new) or legacy agent
-            if use_react:
-                result = await agent.run_react_agent(question, community_prior=community_prior)
-            else:
-                result = await agent.run_forecast(question, community_prior=community_prior)
-            
-            results.append({
-                "config": config,
-                "result": result
-            })
-            
+        else:
+            result = await agent.run_forecast(question, community_prior=community_prior)
+        return {"config": config, "result": result}
+
+    tasks = [_run_one(cfg) for cfg in models]
+    print(f"Running {len(models)} models in parallel...")
+    settled = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    for i, outcome in enumerate(settled):
+        config = models[i]
+        if isinstance(outcome, Exception):
+            logger.error(f"Error running {config['label']}: {outcome}")
+            full_log_content += f"\n\nERROR running {config['label']}: {outcome}\n\n"
+            print(f"  {config['label']}: FAILED ({outcome})")
+        else:
+            results.append(outcome)
+            result = outcome["result"]
+
             # Build sources table for this model
             sources_table = ""
             if hasattr(result, 'sources') and result.sources:
                 sources_table = "\n--- SOURCES CONSULTED ---\n"
                 sources_table += "| # | Title | URL | Date |\n|---|-------|-----|------|\n"
-                for i, src in enumerate(result.sources[:15], 1):  # Limit to 15 sources
+                for j, src in enumerate(result.sources[:15], 1):
                     title = src.get('title', 'N/A')[:50]
                     url = src.get('url', 'N/A')
                     date = src.get('date', 'N/A')
-                    sources_table += f"| {i} | {title} | {url} | {date} |\n"
-            
+                    sources_table += f"| {j} | {title} | {url} | {date} |\n"
+
             # Build metrics block
             metrics_block = "\n--- METRICS ---\n"
             if hasattr(result, 'search_count'):
@@ -1246,7 +1826,11 @@ async def run_ensemble_forecast(
             if hasattr(result, 'token_usage') and result.token_usage:
                 tu = result.token_usage
                 metrics_block += f"Tokens: prompt={tu.get('prompt', 0):,}, completion={tu.get('completion', 0):,}, total={tu.get('total', 0):,}\n"
-            
+            if hasattr(result, "warnings") and result.warnings:
+                metrics_block += f"Warnings: {len(result.warnings)}\n"
+            if hasattr(result, "risk_flags") and result.risk_flags:
+                metrics_block += f"Risk Flags: {', '.join(sorted(set(result.risk_flags)))}\n"
+
             log_section = f"""
 {'='*60}
 MODEL: {config['label']} ({config['name']})
@@ -1260,12 +1844,12 @@ PREDICTION: {result.probability:.1%}
 --- EXPLANATION ---
 {result.explanation}
 """
+            if getattr(result, "warnings", None):
+                log_section += "\n--- WARNINGS ---\n" + "\n".join([f"- {w}" for w in result.warnings]) + "\n"
+            if getattr(result, "risk_flags", None):
+                log_section += "\n--- RISK FLAGS ---\n" + "\n".join([f"- {rf}" for rf in sorted(set(result.risk_flags))]) + "\n"
             full_log_content += log_section
-            print(f"   Result: {result.probability:.1%}")
-
-        except Exception as e:
-            logger.error(f"Error running {config['label']}: {e}")
-            full_log_content += f"\n\nERROR running {config['label']}: {e}\n\n"
+            print(f"  {config['label']}: {result.probability:.1%} ({result.search_count} searches)")
 
     # Save Log File
     safe_q = "".join(c for c in question[:50] if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
@@ -1289,48 +1873,248 @@ PREDICTION: {result.probability:.1%}
             "individual_results": []
         }
 
-    probs = [r["result"].probability for r in results]
-    avg_prob = sum(probs) / len(probs)
-    
+    # Filter out failed models: exclude results with 0 searches AND 0.5 probability
+    # (these are models that returned errors and fell back to the default)
+    valid_results = [
+        r for r in results
+        if not (r["result"].probability == 0.5 and r["result"].search_count == 0)
+    ]
+    if not valid_results:
+        # All models failed — fall back to all results
+        logger.warning("All models appear to have failed (0.5 with 0 searches). Using unfiltered results.")
+        valid_results = results
+
+    if len(valid_results) < len(results):
+        failed_labels = [r["config"]["label"] for r in results if r not in valid_results]
+        logger.warning(f"Filtered out failed models from ensemble: {failed_labels}")
+
+    def _is_forced_extraction(result: AgentForecastOutput) -> bool:
+        explanation = (result.explanation or "").lower()
+        return (
+            "[forced extraction" in explanation
+            or "[agent reached iteration limit]" in explanation
+        )
+
+    def _reliability_label(result: AgentForecastOutput) -> str:
+        if _is_forced_extraction(result):
+            return "LOW"
+        total_tokens = (result.token_usage or {}).get("total", 0)
+        if total_tokens >= 60000:
+            return "MEDIUM"
+        return "HIGH"
+
+    def _quality_weight(result: AgentForecastOutput) -> float:
+        # Cap search contribution so query spam cannot dominate.
+        search_component = float(max(1, min(result.search_count, 8)))
+        reliability_multiplier = 1.0
+        if _is_forced_extraction(result):
+            reliability_multiplier *= 0.35
+        total_tokens = (result.token_usage or {}).get("total", 0)
+        if total_tokens >= 70000:
+            reliability_multiplier *= 0.85
+        return max(0.5, search_component * reliability_multiplier)
+
+    # --- Judge / Synthesis Step ---
+    # Build summaries of each model's key evidence and probability for the judge
+    model_summaries_parts = []
+    for r in valid_results:
+        label = r["config"]["label"]
+        prob = r["result"].probability
+        searches = r["result"].search_count
+        reliability = _reliability_label(r["result"])
+        warn_text = "; ".join((r["result"].warnings or [])[:3]) if hasattr(r["result"], "warnings") else ""
+        risk_text = ", ".join(sorted(set(r["result"].risk_flags or []))) if hasattr(r["result"], "risk_flags") else ""
+        market_found = False
+        if hasattr(r["result"], "diagnostics") and r["result"].diagnostics:
+            market_found = bool((r["result"].diagnostics.get("market_snapshot") or {}).get("found"))
+        explanation = r["result"].explanation or "No explanation available"
+        # Trim explanation to key parts (last 1500 chars contains the reasoning/forecast)
+        if len(explanation) > 2000:
+            explanation = explanation[-2000:]
+        model_summaries_parts.append(
+            f"### {label} - {prob:.0%} (based on {searches} searches, reliability={reliability}, market_found={market_found})\n"
+            f"Warnings: {warn_text or 'None'}\n"
+            f"Risk flags: {risk_text or 'None'}\n\n"
+            f"{explanation}"
+        )
+    model_summaries = "\n\n---\n\n".join(model_summaries_parts)
+
+    # Compute weighted average as fallback
+    weights = [_quality_weight(r["result"]) for r in valid_results]
+    probs = [r["result"].probability for r in valid_results]
+
+    # Outlier cross-exam: interrogate large deviations instead of hard-dropping.
+    if flags.outlier_xexam and len(valid_results) >= 3:
+        med = median(probs)
+        for idx, r in enumerate(valid_results):
+            pp_diff = abs(r["result"].probability - med) * 100
+            if pp_diff <= outlier_threshold_pp:
+                continue
+            ledger = []
+            if getattr(r["result"], "diagnostics", None):
+                ledger = r["result"].diagnostics.get("evidence_ledger", []) or []
+            ledger_summary = "\n".join(
+                [
+                    f"{item.get('id')} | {item.get('directness_tag')} | {item.get('url_ref')}"
+                    for item in ledger[:8]
+                ]
+            ) or "No ledger items"
+            try:
+                xexam_prompt = OUTLIER_CROSSEXAM_PROMPT.format(
+                    question=question,
+                    canonical_spec_text=canonical_spec_text,
+                    model_answer=(r["result"].explanation or "")[-5000:],
+                    ledger_summary=ledger_summary,
+                )
+                xexam_response = await call_openrouter_llm(
+                    prompt=xexam_prompt,
+                    model="google/gemini-2.5-flash",
+                    temperature=0.2,
+                    max_tokens=1200,
+                    usage_label="outlier_xexam",
+                )
+                if r["result"].diagnostics is not None:
+                    r["result"].diagnostics["outlier_cross_exam"] = xexam_response
+                # Require explicit grounding syntax.
+                grounding_hits = len(
+                    re.findall(r'Evidence:\s*(LEDGER-\d+|ASSUMPTION)', xexam_response, re.IGNORECASE)
+                )
+                if grounding_hits < 3:
+                    weights[idx] *= 0.60
+                    r["result"].warnings.append(
+                        f"Outlier cross-exam ungrounded (diff {pp_diff:.1f}pp, grounding_hits={grounding_hits})."
+                    )
+                    r["result"].risk_flags.append("OUTLIER_UNGROUNDED")
+                else:
+                    r["result"].warnings.append(
+                        f"Outlier cross-exam passed (diff {pp_diff:.1f}pp)."
+                    )
+            except Exception as xexc:
+                r["result"].warnings.append(f"Outlier cross-exam failed: {xexc}")
+                r["result"].risk_flags.append("OUTLIER_XEXAM_ERROR")
+
+    total_weight = sum(weights)
+    weighted_avg = sum(p * w for p, w in zip(probs, weights)) / total_weight
+
+    # Run the judge synthesis via LLM
+    judge_model = "google/gemini-2.5-flash"
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    judge_prompt = JUDGE_SYNTHESIS_PROMPT.format(
+        question=question,
+        today=today_str,
+        model_summaries=model_summaries,
+    )
+
+    avg_prob = weighted_avg  # default to weighted average
+    judge_reasoning = ""
+    try:
+        print("\nRunning judge synthesis...")
+        judge_response = await call_openrouter_llm(
+            prompt=judge_prompt,
+            model=judge_model,
+            temperature=0.3,
+            max_tokens=4000,
+            usage_label="judge_synthesis",
+            reasoning_effort="medium",
+        )
+        # Extract probability from judge response
+        judge_response_plain = judge_response.replace("*", "")
+        judge_prob_match = re.search(r'FINAL_PROBABILITY\s*:\s*(\d{1,3}(?:\.\d+)?)\s*%', judge_response_plain, re.IGNORECASE)
+        if not judge_prob_match:
+            judge_prob_match = re.search(r'FINAL_PROBABILITY[^0-9]{0,12}(\d{1,3}(?:\.\d+)?)\s*%', judge_response_plain, re.IGNORECASE)
+        if not judge_prob_match:
+            judge_prob_match = re.search(r'Final probability[^0-9]{0,12}(\d{1,3}(?:\.\d+)?)\s*%', judge_response_plain, re.IGNORECASE)
+        if judge_prob_match:
+            judge_prob = float(judge_prob_match.group(1)) / 100.0
+            if 0.01 <= judge_prob <= 0.99:
+                avg_prob = judge_prob
+                judge_reasoning = judge_response
+                logger.info(f"Judge synthesis probability: {avg_prob:.1%}")
+            else:
+                logger.warning(f"Judge probability out of range: {judge_prob}, using weighted average")
+        else:
+            logger.warning("Could not extract probability from judge response, using weighted average")
+            judge_reasoning = judge_response
+    except Exception as e:
+        logger.error(f"Judge synthesis failed: {e}, using weighted average")
+
+    # Log weighting details
+    for r, w in zip(valid_results, weights):
+        label = r["config"]["label"]
+        p = r["result"].probability
+        reliability = _reliability_label(r["result"])
+        pct_w = w / total_weight * 100
+        logger.info(f"Individual: {label} p={p:.1%} weight={w:.2f} ({pct_w:.0f}%), reliability={reliability}")
+    logger.info(f"Weighted average: {weighted_avg:.1%} | Judge synthesis: {avg_prob:.1%}")
+
     print(f"\n{'='*60}")
-    print(f"FINAL ENSEMBLE PREDICTION: {avg_prob:.1%}")
+    print(f"WEIGHTED AVERAGE: {weighted_avg:.1%}")
+    print(f"JUDGE SYNTHESIS:  {avg_prob:.1%}")
+    print(f"FINAL PREDICTION: {avg_prob:.1%}")
     print(f"{'='*60}")
 
     # Create compact summary
-    summary_lines = [f"Ensemble Prediction: {avg_prob:.1%}"]
+    summary_lines = [f"Final Prediction: {avg_prob:.1%} (Judge Synthesis)"]
+    summary_lines.append(f"Weighted Average: {weighted_avg:.1%}")
     summary_lines.append("Individual Models:")
     for r in results:
-        summary_lines.append(f"- {r['config']['label']}: {r['result'].probability:.1%}")
-    
+        rel = _reliability_label(r["result"])
+        warn_count = len(r["result"].warnings or []) if hasattr(r["result"], "warnings") else 0
+        risk_count = len(set(r["result"].risk_flags or [])) if hasattr(r["result"], "risk_flags") else 0
+        summary_lines.append(
+            f"- {r['config']['label']}: {r['result'].probability:.1%} "
+            f"({r['result'].search_count} searches, reliability={rel}, warnings={warn_count}, risks={risk_count})"
+        )
+
     summary_text = "\n".join(summary_lines)
-    
-    # Create full reasoning text including all model explanations
+
+    # Create full reasoning text including all model explanations + judge
     full_reasoning_parts = [f"# Ensemble Forecast: {avg_prob:.1%}\n"]
     for r in results:
         model_name = r['config']['label']
         model_prob = r['result'].probability
         model_explanation = r['result'].explanation or "No explanation available"
         full_reasoning_parts.append(f"## {model_name}: {model_prob:.1%}\n\n{model_explanation}\n")
-    
+    if judge_reasoning:
+        full_reasoning_parts.append(f"## Judge Synthesis: {avg_prob:.1%}\n\n{judge_reasoning}\n")
+
     full_reasoning = "\n---\n\n".join(full_reasoning_parts)
-    
+
+    # Add judge section to log
+    judge_log = ""
+    if judge_reasoning:
+        judge_log = f"""
+
+{'='*60}
+JUDGE SYNTHESIS (Model: {judge_model})
+{'='*60}
+
+{judge_reasoning}
+"""
+    full_log_content += judge_log
     full_log_content += f"\n\n{'='*60}\nSUMMARY\n{'='*60}\n{summary_text}\n"
 
-    # Log file already saved above
+    # Re-save log file with judge synthesis and summary appended
+    with open(log_filename, "w", encoding="utf-8") as f:
+        f.write(full_log_content)
+    print(f"Updated log saved to: {log_filename}")
 
     # Post to Metaculus
     if publish_to_metaculus:
         metaculus_token = os.getenv("METACULUS_TOKEN")
         if metaculus_token:
             try:
-                from forecasting_tools import MetaculusApi
-                found_question = MetaculusApi.get_question_by_url(question)
+                if question_url_for_post:
+                    found_question = MetaculusApi.get_question_by_url(question_url_for_post)
+                else:
+                    found_question = MetaculusApi.get_question_by_url(question)
                 if found_question:
                     # Handle different attribute names (.id, .question_id, .id_of_question, .post_id)
                     q_id = (
                         getattr(found_question, 'id', None) or 
                         getattr(found_question, 'question_id', None) or 
                         getattr(found_question, 'id_of_question', None) or
+                        getattr(found_question, 'id_of_post', None) or
                         getattr(found_question, 'post_id', None)
                     )
                     if q_id:
@@ -1346,8 +2130,13 @@ PREDICTION: {result.probability:.1%}
                         # Post a comment with the rationale
                         comment_text = f"## Automated Ensemble Forecast\n\n{summary_text}\n\n---\n*Generated by forecasting bot*"
                         try:
+                            post_id = (
+                                getattr(found_question, 'id_of_post', None) or
+                                getattr(found_question, 'post_id', None) or
+                                (getattr(found_question, 'api_json', {}) or {}).get('id')
+                            )
                             MetaculusApi.post_question_comment(
-                                question_id=q_id,
+                                post_id=int(post_id),
                                 comment_text=comment_text,
                             )
                             print("Comment with rationale posted successfully.")
@@ -1365,7 +2154,14 @@ PREDICTION: {result.probability:.1%}
         "summary_text": summary_text,
         "full_reasoning": full_reasoning,
         "full_log": full_log_content,
-        "individual_results": results
+        "individual_results": results,
+        "feature_flags": {
+            "spec_lock": flags.spec_lock,
+            "evidence_ledger": flags.evidence_ledger,
+            "numeric_provenance": flags.numeric_provenance,
+            "market_snapshot": flags.market_snapshot,
+            "outlier_xexam": flags.outlier_xexam,
+        },
     }
 
 

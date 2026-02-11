@@ -40,6 +40,11 @@ on:
         required: false
         default: "2.0"
         type: string
+      max_open_questions:
+        description: "Optional cap for OPEN questions processed (0 = no cap)"
+        required: false
+        default: "0"
+        type: string
   # DISABLED: GitHub cron is unreliable at midnight UTC
   # Using cron-job.org external trigger instead
   # schedule:
@@ -110,6 +115,7 @@ jobs:
           MIN_QUESTIONS="${{ github.event.inputs.min_questions || '1' }}"
           MIN_POST_ATTEMPTS="${{ github.event.inputs.min_post_attempts || '1' }}"
           INTER_QUESTION_DELAY_SECONDS="${{ github.event.inputs.inter_question_delay_seconds || '2.0' }}"
+          MAX_OPEN_QUESTIONS="${{ github.event.inputs.max_open_questions || '0' }}"
 
           poetry run python bot/main_forecast_pipeline.py \
             --mode tournament \
@@ -118,6 +124,7 @@ jobs:
             --min-questions "${MIN_QUESTIONS}" \
             --min-post-attempts "${MIN_POST_ATTEMPTS}" \
             --inter-question-delay-seconds "${INTER_QUESTION_DELAY_SECONDS}" \
+            --max-open-questions "${MAX_OPEN_QUESTIONS}" \
             ${EXTRA_FLAGS} 2>&1 | tee bot.log
 
       - name: Summarize results

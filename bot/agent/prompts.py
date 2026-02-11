@@ -36,108 +36,156 @@ Forecast this question: {question}
 
 Today's date: {today}
 {prior_text}
+Canonical spec (must be followed exactly):
+{canonical_spec_text}
 
-## HOW TO USE SEARCH
+## HOW TO SEARCH
 
-Search the web by outputting: SEARCH("your query here")
-Rules:
-1. One SEARCH per response, then STOP and wait for results
-2. Do NOT simulate results - I provide real results
-
-## REQUIRED OUTPUT STRUCTURE
-
-Your final forecast MUST follow this exact structure. This is not optional.
-
----
-
-### 1. RESOLUTION RULES INTERPRETATION
-Quote 2-4 lines from the market/question definition.
-- **YES requires:** [exact triggering condition]
-- **NO if:** [fallback/default condition]  
-- **Key distinction:** [what this question is REALLY asking - announcement vs transfer vs control, etc.]
-- **Deadline:** [exact date/time if specified]
-
-### 2. MARKET CALIBRATION
-You MUST search for actual market odds and compare:
-- **Current market price:** [X%] (from Polymarket/Metaculus/Kalshi)
-- **Market-implied probability:** [interpretation]
-- **If I diverge significantly (>5%), here's why:** [specific disagreement with 2-3 concrete reasons]
-
-### 3. PATHWAY DECOMPOSITION
-Enumerate 3-5 distinct pathways by which YES could occur:
-
-| # | Pathway | Key Gates (who/what must happen) | Time Feasible? | P(Path) |
-|---|---------|----------------------------------|----------------|---------|
-| 1 | [e.g., Negotiated treaty] | [Gate A, Gate B, Gate C] | ✓ or ✗ | X% |
-| 2 | [e.g., Coerced agreement] | [Gate D, Gate E] | ✓ or ✗ | Y% |
-| 3 | [e.g., Unilateral declaration] | [Gate F, Gate G] | ✓ or ✗ | Z% |
-| 4 | [e.g., De facto control] | [Gate H, Gate I] | ✓ or ✗ | W% |
-
-### 4. GATE ANALYSIS (for top 1-2 pathways)
-For each substantive pathway, show the probability chain:
-
-**Pathway 1: [Name]**
-```
-P(Path1) = P(Gate A: ...) × P(Gate B: ...) × P(Gate C: ...) × P(Qualifies under rules)
-         = [X]% × [Y]% × [Z]% × [W]%
-         = [Result]%
-```
-
-### 5. PROBABILITY COMPUTATION
-Sum all pathways (they should be roughly mutually exclusive):
-
-| Pathway | Probability |
-|---------|-------------|
-| Negotiated | X% |
-| Coerced | Y% |
-| Unilateral | Z% |
-| De facto | W% |
-| **TOTAL P(YES)** | **Σ%** |
-
-CRITICAL: Your FINAL probability below MUST MATCH this TOTAL. If it doesn't, fix it.
-
-### 6. UPDATE TRIGGERS
-List 5 concrete events that would shift your forecast by ≥3 percentage points:
-
-1. [Event] → [+X% or -X%] because [reason]
-2. [Event] → [+X% or -X%] because [reason]
-3. [Event] → [+X% or -X%] because [reason]
-4. [Event] → [+X% or -X%] because [reason]
-5. [Event] → [+X% or -X%] because [reason]
-
-### 7. EXECUTIVE RATIONALE (2-3 paragraphs)
-
-**Paragraph 1 - Thesis + Base Rate:**
-State your bottom line and the reference class/base rate you're anchoring to.
-
-**Paragraph 2 - Top 3 Drivers:**
-List the 3 factors most affecting your probability, with direction and rough magnitude.
-
-**Paragraph 3 - Scenarios + What Would Change My Mind:**
-Describe the 1-2 most likely YES scenarios and what evidence would make you update significantly.
-
-### 8. FINAL ANSWER
-
-FINAL_FORECAST
-Probability: [must match TOTAL P(YES) from section 5]
-One-line summary: [Single sentence capturing your reasoning]
-
----
+You can search the web by writing: SEARCH("your query here")
+You may include multiple SEARCH() calls in one response. After you write SEARCH commands, STOP and wait — I will provide real results.
 
 ## WORKFLOW
 
-1. First, understand the question - identify what EXACTLY triggers YES
-2. SEARCH for the actual market odds on Polymarket/Metaculus/prediction markets
-3. SEARCH for current status and key actors' positions
-4. SEARCH for legal/procedural requirements (gates)
-5. Build your pathway table and gate analysis
-6. Compute probabilities explicitly - THE SUM IS YOUR FINAL PROBABILITY
-7. Output your FINAL_FORECAST with the full structure above
+1. SEARCH for the current status/state of the topic (what has happened so far? what is the latest?)
+2. SEARCH for key facts, deadlines, and actors that will determine the outcome
+3. SEARCH for prediction market odds if relevant (Polymarket, Metaculus, Manifold, Kalshi)
+4. Analyze the evidence you found
+5. Output your FINAL_FORECAST
 
-IMPORTANT: If your probability diverges significantly from market odds, you must explain WHY. 
-Markets aren't always right, but you need specific reasons for disagreement.
+Aim to complete your forecast within 3-4 search rounds. Do not over-research.
+
+## FINAL OUTPUT FORMAT
+
+When you have enough information, output your forecast in this EXACT format:
+
+**Spec echo:** [Repeat the canonical spec in one short line. Do not change target, threshold, or time window.]
+
+**Resolution criteria:** [What exactly triggers YES vs NO]
+
+**Key evidence:**
+- [Fact 1 from research]
+- [Fact 2 from research]
+- [Fact 3 from research]
+
+**Reference class:** [Name a concrete class, e.g. "Of the last 12 US government funding deadlines since 2018, 9 were resolved before a lapse." If you cannot find a specific statistic, state "No concrete base rate found" — do NOT invent one.]
+
+**Reasoning:** [2-3 sentences: How does your evidence compare to the base rate? What factors push the probability up or down? List the main pathways to YES with individual probabilities that sum to your total.]
+
+**Key update trigger:** [Single most important event that would shift this estimate >15 percentage points, e.g. "Senate leadership announcing a deal framework would move this to 75%+"]
+
+FINAL_FORECAST
+Probability: [your estimate as a percentage, e.g. 35%]
+One-line summary: [single sentence]
+
+IMPORTANT RULES:
+- The Probability line MUST be a number followed by %. Example: Probability: 25%
+- Do NOT output 50% unless you genuinely believe the outcome is a coin flip
+- Extreme values (below 5% or above 95%) are fine when evidence supports them
+- Base your estimate on the EVIDENCE you found, not gut feeling
+- If prediction markets have prices for this question, state them and explain any deviation from your estimate
+- If you did not find a direct market for this exact question, write exactly: "No direct market found."
 
 BEGIN by understanding the question and issuing your first SEARCH.
+"""
+
+# =============================================================================
+# JUDGE / SYNTHESIS PROMPT
+# =============================================================================
+
+JUDGE_SYNTHESIS_PROMPT = """You are a meta-forecaster. Three independent forecasting agents have researched the same question. Your job is to synthesize their evidence and reasoning into one final calibrated probability.
+
+## Question
+{question}
+
+Today's date: {today}
+
+## Individual Forecasts
+
+{model_summaries}
+
+## Your Task
+
+1. Identify the STRONGEST evidence from each model (don't just average — think about which evidence matters most)
+2. Note any prediction market data found by any model. If markets price this differently from the models, explain why the market may be right or wrong.
+3. Use the provided reliability tags. Penalize models marked reliability=LOW unless their evidence is clearly superior and corroborated.
+4. Identify where models DISAGREE and adjudicate based on evidence quality and source quality.
+5. Produce your synthesized probability. If one model is a clear outlier, explain whether you are discounting it.
+
+Output in this format:
+
+**Best evidence across all models:**
+- [Most important fact]
+- [Second most important fact]
+- [Third most important fact]
+
+**Market data:** [State any prediction market prices found, or "None found"]
+
+**Model agreement/disagreement:** [Where do models agree? Where do they disagree and why?]
+
+**Synthesis reasoning:** [2-3 sentences explaining your final probability, referencing specific evidence]
+
+FINAL_PROBABILITY: [number]%
+"""
+
+# =============================================================================
+# CANONICAL SPEC + VALIDATION PROMPTS
+# =============================================================================
+
+SPEC_EXTRACTION_PROMPT = """Extract a canonical forecast spec from this question.
+
+Question:
+{question}
+
+Return JSON only with:
+{{
+  "target": "what is being predicted",
+  "yes_condition": "explicit YES trigger",
+  "no_condition": "explicit NO trigger",
+  "time_window": "deadline or resolve window",
+  "threshold": "numeric threshold if any, else empty",
+  "metric": "metric/entity measured, else empty",
+  "canonical_one_line": "single-line canonical spec"
+}}
+"""
+
+SPEC_CONSISTENCY_PROMPT = """Check whether the model answer matches the canonical spec.
+
+Canonical spec:
+{canonical_spec_text}
+
+Model answer:
+{model_answer}
+
+Return JSON only:
+{{
+  "status": "OK | MINOR_DRIFT | MAJOR_DRIFT",
+  "reason": "short explanation"
+}}
+"""
+
+OUTLIER_CROSSEXAM_PROMPT = """You are cross-examining an outlier forecast.
+
+Question:
+{question}
+
+Canonical spec:
+{canonical_spec_text}
+
+Model forecast text:
+{model_answer}
+
+Evidence ledger summary:
+{ledger_summary}
+
+Task:
+- State top 3 drivers for this forecast.
+- Each driver must include either an evidence id (e.g., LEDGER-3) or be labeled ASSUMPTION.
+- Keep concise and explicit.
+
+Output format:
+1. [Driver] | Evidence: [LEDGER-id or ASSUMPTION]
+2. [Driver] | Evidence: [LEDGER-id or ASSUMPTION]
+3. [Driver] | Evidence: [LEDGER-id or ASSUMPTION]
 """
 
 # =============================================================================

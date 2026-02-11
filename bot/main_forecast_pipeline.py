@@ -392,6 +392,7 @@ class TemplateForecaster(ForecastBot):
         tournament_id: int | str,
         question_types: Literal["all", "binary"] = "all",
         inter_question_delay_seconds: float = 2.0,
+        max_open_questions: int = 0,
         return_exceptions: bool = False,
     ) -> list[Any]:
         """
@@ -456,6 +457,12 @@ class TemplateForecaster(ForecastBot):
             )
             if not supported_open_qs:
                 return []
+            if max_open_questions > 0:
+                supported_open_qs = supported_open_qs[:max_open_questions]
+                logger.info(
+                    f"Applying max_open_questions={max_open_questions}. "
+                    f"Processing {len(supported_open_qs)} question(s) this run."
+                )
             reports: list[Any] = []
             delay = max(0.0, float(inter_question_delay_seconds))
             for idx, question in enumerate(supported_open_qs, start=1):
@@ -544,6 +551,12 @@ def main():
         default=float(os.getenv("INTER_QUESTION_DELAY_SECONDS", "2.0")),
         help="Delay between tournament questions to reduce API rate-limit errors.",
     )
+    parser.add_argument(
+        "--max-open-questions",
+        type=int,
+        default=int(os.getenv("MAX_OPEN_QUESTIONS", "0")),
+        help="Optional cap for number of OPEN questions processed in tournament mode (0 = no cap).",
+    )
 
     args = parser.parse_args()
     run_mode = args.mode
@@ -554,7 +567,8 @@ def main():
         predictions_per_research_report=1,  # 3 models, but treated as 1 ensemble
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
-        folder_to_save_reports_to="./forecastingoutput/reports",
+        # Disable fragile internal saver from forecasting_tools; we persist via --output-file below.
+        folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
     )
 
@@ -587,6 +601,7 @@ def main():
                 selected_tournament_id,
                 question_types=args.question_types,
                 inter_question_delay_seconds=args.inter_question_delay_seconds,
+                max_open_questions=args.max_open_questions,
                 return_exceptions=True,
             )
         )

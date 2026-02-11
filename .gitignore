@@ -7,6 +7,9 @@ forecastingoutput/
 runs.json
 run_log.txt
 .claude/
+league.sqlite3
+league.sqlite3-journal
+predictions/feedback_loop/
 
 
 ### General gitignore ###

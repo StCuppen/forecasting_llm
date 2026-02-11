@@ -1,0 +1,60 @@
+db_path = "league.sqlite3"
+window_days = 7
+
+[forecast]
+dry_run_default = true
+apply_calibration = false
+max_questions_per_tick = 25
+prediction_log_dir = "predictions/feedback_loop"
+write_prediction_markdown = true
+
+[scoring]
+logloss_epsilon = 1e-9
+
+[updater]
+eta = 0.4
+default_weight = 1.0
+
+[calibration]
+enabled = true
+min_points = 50
+window_size = 500
+bins = 10
+
+[diagnostics]
+llm_assisted = false
+deterministic_only = true
+
+[sources.metaculus]
+enabled = true
+base_url = "https://www.metaculus.com/api2"
+timeout_seconds = 20
+max_retries = 3
+cache_ttl_seconds = 300
+
+[sources.kalshi]
+enabled = true
+base_url = "https://api.elections.kalshi.com/trade-api/v2"
+timeout_seconds = 20
+max_retries = 3
+cache_ttl_seconds = 300
+
+[sources.polymarket]
+enabled = true
+base_url = "https://gamma-api.polymarket.com"
+timeout_seconds = 20
+max_retries = 3
+cache_ttl_seconds = 300
+
+[sources.manifold]
+enabled = true
+base_url = "https://api.manifold.markets/v0"
+timeout_seconds = 20
+max_retries = 3
+cache_ttl_seconds = 300
+
+[domain_keywords]
+sports = ["sports", "nba", "nfl", "mlb", "soccer", "epl"]
+macro = ["economy", "inflation", "fed", "gdp", "rates"]
+crypto = ["crypto", "bitcoin", "ethereum", "solana"]
+politics = ["election", "policy", "government", "congress"]

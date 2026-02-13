@@ -1,3 +1,9 @@
+# LEGACY — Do Not Update
+
+> **This file is superseded by `memory/`.** All new memory updates go there.
+> See `memory/README.md` for instructions.
+
+---
 
 ## Session Update (2026-02-11, Codex GPT-5) - Safe Guardrail Modules + Posted Test Forecast
 

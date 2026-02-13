@@ -62,6 +62,7 @@ from forecasting_tools import (
 
 from bot.agent.utils import ExaClient, SerperClient, TavilyClient, SonarClient, BraveClient, reset_token_usage, get_token_usage
 from bot.agent.agent_experiment import run_ensemble_forecast
+from bot.coherence import enforce_sum_to_one
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -307,43 +308,48 @@ class TemplateForecaster(ForecastBot):
         question: MultipleChoiceQuestion,
         research: str,
     ) -> PredictedOptionList:
-        """
-        Forecast multiple choice using a conservative fallback prior.
-
-        We intentionally keep this deterministic and robust so tournament runs can
-        handle non-binary questions without crashing. Better model-based MC
-        forecasting can replace this later.
-        """
         options = [opt.strip() for opt in question.options if opt and opt.strip()]
         if not options:
             raise ValueError("Multiple choice question has no options.")
 
-        base_probability = 1.0 / len(options)
-        predicted_options = [
-            {"option_name": option, "probability": base_probability}
-            for option in options
-        ]
-        # Force exact sum=1.0 to avoid small floating-point drift.
-        if len(predicted_options) > 1:
-            running_sum = sum(item["probability"] for item in predicted_options[:-1])
-            predicted_options[-1]["probability"] = max(0.0, min(1.0, 1.0 - running_sum))
-
-        logger.info(
-            f"Generated fallback multiple-choice forecast (uniform prior) for {len(options)} options."
-        )
-        return PredictedOptionList(predicted_options=predicted_options)
+        try:
+            result = await run_ensemble_forecast(
+                question=question.question_text,
+                models=None,
+                publish_to_metaculus=False,
+                question_type="multiple_choice",
+                options=options,
+            )
+            mc_probs = result.get("mc_probabilities")
+            if not isinstance(mc_probs, dict):
+                raise ValueError("Missing mc_probabilities from ensemble output")
+            normalized = enforce_sum_to_one({str(k): float(v) for k, v in mc_probs.items()})
+            predicted_options = [
+                {"option_name": option, "probability": float(normalized.get(option, 0.0))}
+                for option in options
+            ]
+            logger.info(
+                "Generated model-based multiple-choice forecast "
+                f"(parse_failure_rate={result.get('parsing_failure_rate')})."
+            )
+            return PredictedOptionList(predicted_options=predicted_options)
+        except Exception as e:
+            logger.warning(f"MC model path failed, using fallback uniform distribution: {e}")
+            base_probability = 1.0 / len(options)
+            predicted_options = [
+                {"option_name": option, "probability": base_probability}
+                for option in options
+            ]
+            if len(predicted_options) > 1:
+                running_sum = sum(item["probability"] for item in predicted_options[:-1])
+                predicted_options[-1]["probability"] = max(0.0, min(1.0, 1.0 - running_sum))
+            return PredictedOptionList(predicted_options=predicted_options)
 
     async def _run_forecast_on_numeric(
         self,
         question: NumericQuestion,
         research: str,
     ) -> NumericDistribution:
-        """
-        Forecast numeric questions with a bounded fallback distribution.
-
-        This yields a valid, monotonic distribution anchored to the question's
-        declared bounds so numeric questions can be processed safely.
-        """
         lower = float(question.lower_bound)
         upper = float(question.upper_bound)
         if not np.isfinite(lower) or not np.isfinite(upper):
@@ -351,41 +357,69 @@ class TemplateForecaster(ForecastBot):
         if upper <= lower:
             raise ValueError(f"Numeric bounds invalid. lower={lower}, upper={upper}")
 
-        span = upper - lower
-        value_fracs = [0.15, 0.35, 0.50, 0.65, 0.85]
-        percentile_points = [0.10, 0.25, 0.50, 0.75, 0.90]
-        values = [lower + (span * frac) for frac in value_fracs]
-
-        # Ensure strictly increasing values, even in narrow ranges.
-        min_step = max(span * 1e-6, 1e-9)
-        for i in range(1, len(values)):
-            if values[i] <= values[i - 1]:
-                values[i] = values[i - 1] + min_step
-
-        # Keep values inside hard bounds for closed ranges.
-        if not question.open_lower_bound:
-            values[0] = max(values[0], lower + min_step)
-        if not question.open_upper_bound:
-            values[-1] = min(values[-1], upper - min_step)
-        for i in range(1, len(values)):
-            if values[i] <= values[i - 1]:
-                values[i] = values[i - 1] + min_step
-
-        logger.info(
-            "Generated fallback numeric distribution using question bounds "
-            f"[{lower}, {upper}]"
-        )
-        return NumericDistribution(
-            declared_percentiles=[
-                {"value": value, "percentile": percentile}
-                for value, percentile in zip(values, percentile_points)
-            ],
-            open_upper_bound=bool(question.open_upper_bound),
-            open_lower_bound=bool(question.open_lower_bound),
-            upper_bound=upper,
-            lower_bound=lower,
-            zero_point=question.zero_point,
-        )
+        unit = str(getattr(question, "unit", "") or getattr(question, "units", "") or "")
+        try:
+            result = await run_ensemble_forecast(
+                question=question.question_text,
+                models=None,
+                publish_to_metaculus=False,
+                question_type="numeric",
+                lower_bound=lower,
+                upper_bound=upper,
+                unit=unit,
+            )
+            pct = result.get("numeric_percentiles")
+            if not isinstance(pct, dict):
+                raise ValueError("Missing numeric_percentiles from ensemble output")
+            points = []
+            for pctl in [10, 25, 50, 75, 90]:
+                value = float(pct.get(pctl, pct.get(str(pctl), lower)))
+                value = max(lower, min(upper, value))
+                points.append({"value": value, "percentile": pctl / 100.0})
+            # monotonic repair in case external coercion introduced small violations
+            for i in range(1, len(points)):
+                if points[i]["value"] < points[i - 1]["value"]:
+                    points[i]["value"] = points[i - 1]["value"]
+            logger.info(
+                "Generated model-based numeric forecast "
+                f"(parse_failure_rate={result.get('parsing_failure_rate')})."
+            )
+            return NumericDistribution(
+                declared_percentiles=points,
+                open_upper_bound=bool(question.open_upper_bound),
+                open_lower_bound=bool(question.open_lower_bound),
+                upper_bound=upper,
+                lower_bound=lower,
+                zero_point=question.zero_point,
+            )
+        except Exception as e:
+            logger.warning(f"Numeric model path failed, using fallback bounded distribution: {e}")
+            span = upper - lower
+            value_fracs = [0.15, 0.35, 0.50, 0.65, 0.85]
+            percentile_points = [0.10, 0.25, 0.50, 0.75, 0.90]
+            values = [lower + (span * frac) for frac in value_fracs]
+            min_step = max(span * 1e-6, 1e-9)
+            for i in range(1, len(values)):
+                if values[i] <= values[i - 1]:
+                    values[i] = values[i - 1] + min_step
+            if not question.open_lower_bound:
+                values[0] = max(values[0], lower + min_step)
+            if not question.open_upper_bound:
+                values[-1] = min(values[-1], upper - min_step)
+            for i in range(1, len(values)):
+                if values[i] <= values[i - 1]:
+                    values[i] = values[i - 1] + min_step
+            return NumericDistribution(
+                declared_percentiles=[
+                    {"value": value, "percentile": percentile}
+                    for value, percentile in zip(values, percentile_points)
+                ],
+                open_upper_bound=bool(question.open_upper_bound),
+                open_lower_bound=bool(question.open_lower_bound),
+                upper_bound=upper,
+                lower_bound=lower,
+                zero_point=question.zero_point,
+            )
 
     async def scan_tournament(
         self,

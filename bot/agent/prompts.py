@@ -89,6 +89,70 @@ BEGIN by understanding the question and issuing your first SEARCH.
 """
 
 # =============================================================================
+# LEAN FORECAST PROMPTS
+# =============================================================================
+
+LEAN_BINARY_FORECAST_PROMPT = """You are a professional forecaster.
+
+QUESTION: {question_title}
+
+BACKGROUND: {background_info}
+
+RESOLUTION CRITERIA (read carefully - your forecast must be about exactly this):
+{resolution_criteria}
+{fine_print}
+
+EVIDENCE FROM RESEARCH:
+{evidence_bundle}
+
+TODAY'S DATE: {today}
+
+Before giving your probability, work through the following:
+
+(a) How much time remains until resolution? What is the exact deadline?
+(b) What is the status quo outcome - what happens if nothing changes between now and the deadline?
+(c) Briefly describe a concrete scenario that leads to YES.
+(d) Briefly describe a concrete scenario that leads to NO.
+(e) What is the base rate for events like this? If unknown, state that explicitly.
+(f) What is the single strongest piece of evidence pushing toward YES? Toward NO?
+(g) Is there anything in the resolution criteria that is easy to misread or that narrows/broadens the question from what you'd naively expect?
+
+Remember: good forecasters put extra weight on the status quo, because the world changes slowly most of the time.
+Do not confuse "will X happen eventually" with "will X happen by the deadline."
+
+After your reasoning, give your final answer as:
+Probability: ZZ%
+"""
+
+
+LEAN_MC_APPEND_PROMPT = """
+You must assign a probability to EACH option. Probabilities must sum to 100%.
+Good forecasters leave some moderate probability on most options to account for unexpected outcomes.
+
+Options:
+{options_list}
+
+After your reasoning, give your final answer as:
+Option A: ZZ%
+Option B: ZZ%
+...
+"""
+
+
+LEAN_NUMERIC_APPEND_PROMPT = """
+You must provide a probability distribution over the outcome by giving percentile estimates.
+Pay careful attention to the UNITS specified in the question.
+The question has bounds: lower={lower_bound}, upper={upper_bound}.
+
+After your reasoning, give your final answer as:
+10th percentile: [value]
+25th percentile: [value]
+50th percentile (median): [value]
+75th percentile: [value]
+90th percentile: [value]
+"""
+
+# =============================================================================
 # JUDGE / SYNTHESIS PROMPT
 # =============================================================================
 

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import math
+import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 from src.core.schemas import Score
 from src.core.storage import Storage
+
+try:
+    from bot.agent.utils import ExaClient
+except Exception:  # pragma: no cover - optional dependency path
+    ExaClient = None  # type: ignore
 
 
 def normalize_weights(weights: dict[str, float]) -> dict[str, float]:
@@ -115,3 +123,85 @@ def run_weekly_calibration(
         versions[domain] = version
     return versions
 
+
+def _keywords(text: str) -> list[str]:
+    toks = re.findall(r"[a-zA-Z]{4,}", (text or "").lower())
+    stop = {
+        "that",
+        "this",
+        "with",
+        "from",
+        "would",
+        "could",
+        "should",
+        "there",
+        "their",
+        "about",
+        "after",
+        "before",
+        "event",
+        "cause",
+        "probability",
+    }
+    return [t for t in toks if t not in stop][:8]
+
+
+def check_signposts(storage: Storage, max_questions: int = 25) -> list[dict[str, Any]]:
+    exa_key = os.getenv("EXA_API_KEY")
+    if not exa_key or ExaClient is None:
+        return []
+    try:
+        exa = ExaClient(api_key=exa_key)
+    except Exception:
+        return []
+
+    checks: list[dict[str, Any]] = []
+    questions = storage.list_questions(statuses=["open", "forecasted"])[:max_questions]
+    for q in questions:
+        pred = storage.get_latest_prediction(q.id)
+        if pred is None:
+            continue
+        signposts = pred.forecast_context.get("signposts") or []
+        if not isinstance(signposts, list) or not signposts:
+            continue
+        per_signpost: list[dict[str, Any]] = []
+        any_fired = False
+        for s in signposts[:5]:
+            if isinstance(s, dict):
+                event = str(s.get("event", "")).strip()
+            else:
+                event = str(s).strip()
+            if not event:
+                continue
+            fired = False
+            snippet = ""
+            try:
+                results = asyncio.run(exa.search(event, num_results=3))
+            except Exception:
+                results = []
+            event_terms = _keywords(event)
+            for r in results:
+                text = f"{r.get('title', '')} {r.get('content', '')}".lower()
+                overlap = sum(1 for t in event_terms if t in text)
+                if overlap >= 2:
+                    fired = True
+                    snippet = str(r.get("title", ""))[:180]
+                    break
+            if fired:
+                any_fired = True
+            per_signpost.append(
+                {
+                    "event": event,
+                    "fired": fired,
+                    "evidence": snippet,
+                }
+            )
+        checks.append(
+            {
+                "question_id": q.id,
+                "question_title": q.title,
+                "trigger_reforecast": any_fired,
+                "signposts": per_signpost,
+            }
+        )
+    return checks

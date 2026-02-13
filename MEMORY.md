@@ -1,6 +1,9 @@
-# Agent Memory (Local Only)
+# LEGACY — Do Not Update
 
-Purpose: keep durable lessons for this repo so repeated failures are avoided.
+> **This file is superseded by `memory/`.** All new memory updates go there.
+> See `memory/README.md` for instructions.
+
+Original purpose: keep durable lessons for this repo so repeated failures are avoided.
 Visibility: local-only via `.git/info/exclude`.
 
 ## Operating Notes

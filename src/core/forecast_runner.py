@@ -127,11 +127,30 @@ def run_forecast_for_question(
     context = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "prompt_template_version": "league-v1",
-        "forecast_pipeline_version": "v1",
+        "forecast_pipeline_version": "v2-lean-aggregation",
         "dry_run": dry_run,
         "apply_calibration": apply_calibration,
         "calibrator_version": calibrator_version,
     }
+    if not dry_run:
+        context["publish_action"] = raw.get("publish_action")
+        context["aggregated_forecast"] = raw.get("aggregated_forecast", {})
+        context["gate_report"] = raw.get("gate_report", {})
+        context["planned_queries"] = raw.get("planned_queries", [])
+        context["executed_queries"] = raw.get("executed_queries", [])
+        context["top_evidence"] = raw.get("top_evidence", [])
+        context["red_team_artifact"] = raw.get("red_team_artifact", "")
+        context["claim_audit"] = raw.get("claim_audit", {})
+        context["signposts"] = raw.get("signposts", [])
+        context["signpost_report"] = raw.get("signpost_report", {})
+        context["parsing_failure_rate"] = raw.get("parsing_failure_rate")
+        context["question_type"] = raw.get("question_type", "binary")
+        context["signal_strength"] = raw.get("signal_strength")
+        context["informativeness"] = raw.get("informativeness")
+        if raw.get("mc_probabilities") is not None:
+            context["mc_probabilities"] = raw.get("mc_probabilities")
+        if raw.get("numeric_percentiles") is not None:
+            context["numeric_percentiles"] = raw.get("numeric_percentiles")
     return ForecastRunResult(
         p_ens=p_ens,
         p_agents=p_agents,

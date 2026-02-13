@@ -10,6 +10,7 @@ from src.core.pipeline import infer_domain_tag
 from src.core.schemas import Prediction, Question
 from src.core.utils import stable_hash, to_iso, utc_now
 from src.jobs.common import bootstrap
+from bot.coherence import QuestionStub, detect_question_families, project_family_constraints
 
 
 def _safe_name(value: str, max_len: int = 80) -> str:
@@ -91,6 +92,28 @@ def run_forecast_open(config_path: str = "league.toml", dry_run: bool | None = N
 
         per_run_limit = min(int(config.forecast.max_questions_per_tick), remaining_budget)
         questions = storage.list_open_unforecasted_questions(limit=per_run_limit)
+        families = detect_question_families(
+            [
+                QuestionStub(
+                    id=q.id,
+                    title=q.title,
+                    resolution_criteria=q.description,
+                )
+                for q in questions
+            ]
+        )
+        coherence_family_by_qid: dict[str, list[dict]] = {}
+        for family in families:
+            payload = {
+                "family_type": family.family_type,
+                "members": list(family.members),
+                "score": family.score,
+                "details": dict(family.details),
+            }
+            for qid in family.members:
+                coherence_family_by_qid.setdefault(qid, []).append(payload)
+
+        prepared_rows: list[dict] = []
         forecasted = 0
         errors = 0
         skipped_due_weekly_limit = max(0, total_open_unforecasted - len(questions))
@@ -104,59 +127,100 @@ def run_forecast_open(config_path: str = "league.toml", dry_run: bool | None = N
                     apply_calibration=config.forecast.apply_calibration,
                     calibrator=calibrator,
                 )
-                storage.upsert_evidence_bundle(result.evidence_bundle)
-                run_id = str(uuid.uuid4())
-                made_at = utc_now()
-                made_at_iso = to_iso(made_at) or ""
-                evidence_urls = [item.url for item in result.evidence_bundle.items]
-                prediction_md_path = None
-                if config.forecast.write_prediction_markdown:
-                    prediction_md_path = write_prediction_markdown(
-                        log_dir=config.forecast.prediction_log_dir,
-                        run_id=run_id,
-                        made_at_iso=made_at_iso,
-                        question=question,
-                        mode=("dry-run" if dry_run else "live"),
-                        domain_tag=domain_tag,
-                        p_ens=result.p_ens,
-                        p_agents=result.p_agents,
-                        model_versions=result.model_versions,
-                        rationale_markdown=result.rationale_markdown,
-                        evidence_urls=evidence_urls,
-                    )
-                forecast_context = dict(result.forecast_context)
-                forecast_context.update(
+                prepared_rows.append(
                     {
-                        "question_snapshot_hash": stable_hash(
-                            f"{question.title}|{question.description}|{question.close_time}|{question.resolve_time_expected}|{question.tags}"
-                        ),
-                        "source": question.source,
+                        "question": question,
                         "domain_tag": domain_tag,
-                        "prediction_markdown_path": prediction_md_path,
+                        "calibrator": calibrator,
+                        "result": result,
                     }
                 )
-                prediction = Prediction(
-                    question_id=question.id,
-                    run_id=run_id,
-                    made_at=made_at,
-                    p_ens=result.p_ens,
-                    p_agents=result.p_agents,
-                    model_versions=result.model_versions,
-                    evidence_bundle_id=result.evidence_bundle.bundle_id,
-                    cost_estimate=result.cost_estimate,
-                    latency=result.latency,
-                    forecast_context=forecast_context,
-                    calibrator_version=(calibrator[0] if calibrator else None),
-                )
-                storage.insert_prediction(prediction)
-                storage.mark_question_status(question.id, "forecasted")
-                forecasted += 1
             except Exception:
                 errors += 1
+
+        base_probs = {row["question"].id: float(row["result"].p_ens) for row in prepared_rows}
+        projected_probs, coherence_adjustments = project_family_constraints(base_probs, families)
+        adjustments_by_qid: dict[str, list[dict]] = {}
+        for adjustment in coherence_adjustments:
+            qid = str(adjustment.get("question_id", ""))
+            if not qid:
+                continue
+            adjustments_by_qid.setdefault(qid, []).append(adjustment)
+
+        for row in prepared_rows:
+            question = row["question"]
+            domain_tag = row["domain_tag"]
+            calibrator = row["calibrator"]
+            result = row["result"]
+            p_before = float(result.p_ens)
+            p_after = float(projected_probs.get(question.id, p_before))
+            coherence_notes = adjustments_by_qid.get(question.id, [])
+            rationale_markdown = result.rationale_markdown
+            if abs(p_after - p_before) > 1e-9:
+                rationale_markdown = (
+                    f"{rationale_markdown.rstrip()}\n\n"
+                    "## Coherence Adjustment\n\n"
+                    f"- Original probability: `{p_before:.6f}`\n"
+                    f"- Projected probability: `{p_after:.6f}`\n"
+                )
+
+            storage.upsert_evidence_bundle(result.evidence_bundle)
+            run_id = str(uuid.uuid4())
+            made_at = utc_now()
+            made_at_iso = to_iso(made_at) or ""
+            evidence_urls = [item.url for item in result.evidence_bundle.items]
+            prediction_md_path = None
+            if config.forecast.write_prediction_markdown:
+                prediction_md_path = write_prediction_markdown(
+                    log_dir=config.forecast.prediction_log_dir,
+                    run_id=run_id,
+                    made_at_iso=made_at_iso,
+                    question=question,
+                    mode=("dry-run" if dry_run else "live"),
+                    domain_tag=domain_tag,
+                    p_ens=p_after,
+                    p_agents=result.p_agents,
+                    model_versions=result.model_versions,
+                    rationale_markdown=rationale_markdown,
+                    evidence_urls=evidence_urls,
+                )
+
+            forecast_context = dict(result.forecast_context)
+            forecast_context.update(
+                {
+                    "question_snapshot_hash": stable_hash(
+                        f"{question.title}|{question.description}|{question.close_time}|{question.resolve_time_expected}|{question.tags}"
+                    ),
+                    "source": question.source,
+                    "domain_tag": domain_tag,
+                    "prediction_markdown_path": prediction_md_path,
+                    "coherence_family": coherence_family_by_qid.get(question.id, []),
+                    "coherence_adjustments": coherence_notes,
+                    "p_ens_before_coherence": p_before,
+                    "p_ens_after_coherence": p_after,
+                }
+            )
+            prediction = Prediction(
+                question_id=question.id,
+                run_id=run_id,
+                made_at=made_at,
+                p_ens=p_after,
+                p_agents=result.p_agents,
+                model_versions=result.model_versions,
+                evidence_bundle_id=result.evidence_bundle.bundle_id,
+                cost_estimate=result.cost_estimate,
+                latency=result.latency,
+                forecast_context=forecast_context,
+                calibrator_version=(calibrator[0] if calibrator else None),
+            )
+            storage.insert_prediction(prediction)
+            storage.mark_question_status(question.id, "forecasted")
+            forecasted += 1
         return {
             "forecasted": forecasted,
             "errors": errors,
             "skipped_due_weekly_limit": skipped_due_weekly_limit,
+            "coherence_adjustments": len(coherence_adjustments),
         }
     finally:
         storage.close()

@@ -3,8 +3,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
-from statistics import median
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse
 import dotenv
@@ -27,10 +26,17 @@ from .utils import (
 from .prompts import (
     FORECASTER_CONTEXT,
     REACT_SYSTEM_PROMPT,
-    JUDGE_SYNTHESIS_PROMPT,
+    LEAN_BINARY_FORECAST_PROMPT,
     SPEC_EXTRACTION_PROMPT,
     SPEC_CONSISTENCY_PROMPT,
     OUTLIER_CROSSEXAM_PROMPT,
+)
+from bot.aggregation import AggregatedForecast, ForecastRun, aggregate_forecasts
+from bot.publish_gate import (
+    EvidenceItem as GateEvidenceItem,
+    SpecLockResult,
+    evaluate_publish_gate,
+    shrink_probability,
 )
 
 from forecasting_tools import MetaculusApi
@@ -1689,6 +1695,11 @@ async def run_ensemble_forecast(
     use_react: bool = True,
     feature_flags: Optional[dict[str, Any]] = None,
     outlier_threshold_pp: float = 15.0,
+    question_type: str = "binary",
+    options: Optional[list[str]] = None,
+    lower_bound: Optional[float] = None,
+    upper_bound: Optional[float] = None,
+    unit: Optional[str] = None,
 ) -> dict:
     """
     Run an ensemble of forecasting agents on a question.
@@ -1709,6 +1720,27 @@ async def run_ensemble_forecast(
         - full_log: str
         - individual_results: list[dict]
     """
+    from .lean_ensemble import run_lean_ensemble_forecast
+
+    return await run_lean_ensemble_forecast(
+        question=question,
+        models=models,
+        publish_to_metaculus=publish_to_metaculus,
+        community_prior=community_prior,
+        use_react=use_react,
+        feature_flags=feature_flags,
+        outlier_threshold_pp=outlier_threshold_pp,
+        question_type=question_type,
+        options=options,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        unit=unit,
+        extract_probability_fn=extract_probability_from_forecast,
+        canonical_spec_extractor=extract_canonical_spec,
+        canonical_spec_formatter=_format_canonical_spec_text,
+        spec_consistency_checker=check_spec_consistency,
+    )
+
     flags = _flags_from_dict(feature_flags)
     original_question_input = question.strip()
     question_url_for_post: Optional[str] = None

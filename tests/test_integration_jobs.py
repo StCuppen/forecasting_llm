@@ -103,7 +103,8 @@ macro = ["macro"]
             self.assertEqual(score_result["scored"], 1)
 
             update_result = run_update_online(config_path=str(cfg))
-            self.assertTrue("macro" in update_result or "general" in update_result)
+            weights = dict(update_result.get("weights", {}))
+            self.assertTrue("macro" in weights or "general" in weights)
 
             store = SQLiteStorage(str(db_path))
             store.init()

@@ -435,6 +435,15 @@ class TemplateForecaster(ForecastBot):
         - Upcoming: Log for visibility (preparation step).
         """
         logger.info(f"Starting Smart Scan for tournament {tournament_id}...")
+        self._last_scan_stats = {
+            "fetched_total": 0,
+            "open_total": 0,
+            "upcoming_total": 0,
+            "supported_open_total": 0,
+            "skipped_unsupported_total": 0,
+            "skipped_already_forecasted_total": 0,
+            "processed_open_total": 0,
+        }
         
         # 1. Fetch Open and Upcoming
         api_filter = ApiFilter(
@@ -452,6 +461,13 @@ class TemplateForecaster(ForecastBot):
                 open_qs.append(q)
             elif q.state == QuestionState.UPCOMING:
                 upcoming_qs.append(q)
+        self._last_scan_stats.update(
+            {
+                "fetched_total": len(questions),
+                "open_total": len(open_qs),
+                "upcoming_total": len(upcoming_qs),
+            }
+        )
         
         # 2. Process Upcoming (Visibility)
         if upcoming_qs:
@@ -474,6 +490,8 @@ class TemplateForecaster(ForecastBot):
                 support_label = "supported types"
 
             skipped = len(open_qs) - len(supported_open_qs)
+            self._last_scan_stats["supported_open_total"] = len(supported_open_qs)
+            self._last_scan_stats["skipped_unsupported_total"] = skipped
             if skipped:
                 type_counts: dict[str, int] = {}
                 for q in open_qs:
@@ -489,7 +507,26 @@ class TemplateForecaster(ForecastBot):
                 f"Found {len(open_qs)} OPEN questions ({len(supported_open_qs)} {support_label}). "
                 "Proceeding to forecast..."
             )
+            skipped_already_forecasted = 0
+            if self.skip_previously_forecasted_questions:
+                remaining_open_qs = []
+                for q in supported_open_qs:
+                    if bool(getattr(q, "already_forecasted", False)):
+                        skipped_already_forecasted += 1
+                        continue
+                    remaining_open_qs.append(q)
+                supported_open_qs = remaining_open_qs
+                self._last_scan_stats["skipped_already_forecasted_total"] = skipped_already_forecasted
+                if skipped_already_forecasted:
+                    logger.info(
+                        f"Skipping {skipped_already_forecasted} previously forecasted questions "
+                        "before processing queue construction."
+                    )
+            logger.info(
+                f"Processable OPEN questions after skip filter: {len(supported_open_qs)}"
+            )
             if not supported_open_qs:
+                self._last_scan_stats["processed_open_total"] = 0
                 return []
             if max_open_questions > 0:
                 supported_open_qs = supported_open_qs[:max_open_questions]
@@ -497,6 +534,7 @@ class TemplateForecaster(ForecastBot):
                     f"Applying max_open_questions={max_open_questions}. "
                     f"Processing {len(supported_open_qs)} question(s) this run."
                 )
+            self._last_scan_stats["processed_open_total"] = len(supported_open_qs)
             reports: list[Any] = []
             delay = max(0.0, float(inter_question_delay_seconds))
             for idx, question in enumerate(supported_open_qs, start=1):
@@ -512,6 +550,7 @@ class TemplateForecaster(ForecastBot):
             return reports
         else:
             logger.info("No OPEN questions found to forecast.")
+            self._last_scan_stats["processed_open_total"] = 0
             return []
 
 
@@ -674,11 +713,19 @@ def main():
     # Run-level diagnostics and guardrails
     publish_flag = bool(getattr(template_bot, 'publish_reports_to_metaculus', False))
     skip_flag = bool(getattr(template_bot, 'skip_previously_forecasted_questions', True))
+    scan_stats = (
+        dict(getattr(template_bot, "_last_scan_stats", {}))
+        if run_mode == "tournament"
+        else {}
+    )
 
     successful_reports = [r for r in forecast_reports if not isinstance(r, BaseException)]
     errored_reports = [r for r in forecast_reports if isinstance(r, BaseException)]
 
     question_count = len(successful_reports)
+    retrieved_from_api_count = int(scan_stats.get("fetched_total", question_count) or 0)
+    processable_open_count = int(scan_stats.get("processed_open_total", question_count) or 0)
+    skipped_from_scan = int(scan_stats.get("skipped_already_forecasted_total", 0) or 0)
     post_attempt_count = 0
     skipped_previously_forecasted_count = 0
     skipped_publish_disabled_count = 0
@@ -692,10 +739,13 @@ def main():
             skipped_previously_forecasted_count += 1
         else:
             post_attempt_count += 1
+    skipped_previously_forecasted_count += skipped_from_scan
 
-    logging.info(f"Retrieved {question_count} questions from tournament")
+    logging.info(f"Retrieved {retrieved_from_api_count} questions from tournament")
     logging.info(
         "Run Stats: "
+        f"retrieved_from_api={retrieved_from_api_count} | "
+        f"processable_open={processable_open_count} | "
         f"total_reports={len(forecast_reports)} | "
         f"success={question_count} | "
         f"errors={len(errored_reports)} | "
@@ -704,15 +754,31 @@ def main():
         f"skipped_publish_disabled={skipped_publish_disabled_count}"
     )
 
-    if run_mode == "tournament" and args.min_questions > 0 and question_count < args.min_questions:
+    if run_mode == "tournament" and args.min_questions > 0 and retrieved_from_api_count < args.min_questions:
         raise SystemExit(
-            f"Retrieved only {question_count} questions, below required minimum {args.min_questions}."
+            f"Retrieved only {retrieved_from_api_count} questions, below required minimum {args.min_questions}."
         )
 
     if args.min_post_attempts > 0 and post_attempt_count < args.min_post_attempts:
-        raise SystemExit(
-            f"Only {post_attempt_count} post attempts, below required minimum {args.min_post_attempts}."
-        )
+        if run_mode == "tournament":
+            if processable_open_count == 0:
+                logging.info(
+                    "No processable open questions remained after type/skip filters; "
+                    "post-attempt minimum waived."
+                )
+            elif skipped_previously_forecasted_count >= processable_open_count:
+                logging.info(
+                    "All processable open questions were already forecasted; "
+                    "post-attempt minimum waived."
+                )
+            else:
+                raise SystemExit(
+                    f"Only {post_attempt_count} post attempts, below required minimum {args.min_post_attempts}."
+                )
+        else:
+            raise SystemExit(
+                f"Only {post_attempt_count} post attempts, below required minimum {args.min_post_attempts}."
+            )
 
     # Post-process explanations to drop the default "Report 1 Summary" section
     # and keep only the full RESEARCH block + forecast rationales.

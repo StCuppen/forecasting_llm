@@ -145,6 +145,14 @@ jobs:
           if ! [[ "${supported_open}" =~ ^[0-9]+$ ]]; then
             supported_open=0
           fi
+          processable_open=$(grep -E "Run Stats:.*processable_open=[0-9]+" bot.log | sed -nE 's/.*processable_open=([0-9]+).*/\1/p' | tail -n1 || true)
+          if [[ -z "${processable_open}" ]]; then
+            processable_open=$(grep -E "Processable OPEN questions after skip filter: [0-9]+" bot.log | sed -nE 's/.*: ([0-9]+).*/\1/p' | tail -n1 || true)
+          fi
+          processable_open=${processable_open:-$supported_open}
+          if ! [[ "${processable_open}" =~ ^[0-9]+$ ]]; then
+            processable_open=${supported_open}
+          fi
 
           # Count submission attempts
           posted=$(grep -E "Submission Attempt: posting forecast" -c bot.log || true)
@@ -168,6 +176,7 @@ jobs:
             echo ""
             echo "**Retrieved questions:** ${retrieved}"
             echo "**Supported open questions:** ${supported_open}"
+            echo "**Processable open questions:** ${processable_open}"
             echo "**Predictions posted:** ${posted}"
             echo "**Skipped previously forecasted:** ${skipped_prev_runstats}"
             echo "**Forecast failures:** ${failures}"
@@ -176,13 +185,13 @@ jobs:
             grep -Eo "https://www\.metaculus\.com/questions/[0-9]+/" bot.log 2>/dev/null | sort -u || true
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # If we had supported open questions but didn't even attempt a submission, fail the run.
+          # If we had processable open questions but didn't even attempt a submission, fail the run.
           # This prevents silent green runs that make zero predictions.
-          if [[ "${supported_open}" -gt 0 && "${posted}" -eq 0 ]]; then
-            if [[ "${skipped_prev}" -ge "${supported_open}" || "${skipped_prev_runstats}" -ge "${supported_open}" ]]; then
-              echo "All supported open questions were already forecasted; zero submission attempts is expected."
+          if [[ "${processable_open}" -gt 0 && "${posted}" -eq 0 ]]; then
+            if [[ "${skipped_prev}" -ge "${processable_open}" || "${skipped_prev_runstats}" -ge "${processable_open}" ]]; then
+              echo "All processable open questions were already forecasted; zero submission attempts is expected."
             else
-              echo "::error::Supported open questions found (${supported_open}) but zero submission attempts were logged."
+              echo "::error::Processable open questions found (${processable_open}) but zero submission attempts were logged."
               exit 1
             fi
           fi
